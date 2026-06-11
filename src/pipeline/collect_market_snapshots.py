@@ -1,40 +1,69 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# collect_market_snapshots.py
+# AAPL & INTC Catalyst Intelligence Pipeline — Orchestrator
+#
+# Session 1 (May 2026): Initial AAPL-only collector, LaunchAgent at 16:15
+# Session 2 (May 2026): Multi-ticker support, all expiries, Greeks via option_metrics.py
+# Session 3 (Jun 2026): Loop through TICKERS list, chain build_database + build_silver
+#                        after collection. LaunchAgent updated to fire at 9:35 + 16:15.
+# ──────────────────────────────────────────────────────────────────────────────
 import os
+import subprocess
 import logging
-from datetime import datetime
-import numpy as np                  # ← ADDED (missing from your imports)
+from datetime import datetime, date
+
 import pandas as pd
-from scipy.stats import norm        # ← ADDED (missing from your imports)
+import numpy as np
+from scipy.stats import norm
 import yfinance as yf
+
+from price_metrics import clean_price, calculate_hv
+from option_metrics import calculate_greeks
+
+## US market holidays for 2026 — extend annually
+MARKET_HOLIDAYS = {
+    date(2026, 1, 1),   ## New Year's Day
+    date(2026, 1, 19),  ## MLK Day
+    date(2026, 2, 16),  ## Presidents Day
+    date(2026, 4, 3),   ## Good Friday
+    date(2026, 5, 25),  ## Memorial Day
+    date(2026, 7, 3),   ## Independence Day (observed)
+    date(2026, 9, 7),   ## Labor Day
+    date(2026, 11, 26), ## Thanksgiving
+    date(2026, 11, 27), ## Day after Thanksgiving (early close — skip for safety)
+    date(2026, 12, 25), ## Christmas
+}
+
+## Tickers to collect — add or remove here
+TICKERS = ["AAPL", "INTC"]
 
 
 class MarketSnapshotCollector:
-    """
-    Collects timestamped snapshots of price history and options chains for a ticker.
+    ## Orchestrates one market snapshot run for a ticker.
+    ## Responsible for: collecting raw data, calling transformations,
+    ## adding metadata, saving outputs, and logging pipeline activity.
+    ##
+    ## Architecture:
+    ## - File 1: orchestration  -> this class
+    ## - File 2: price metrics  -> price_metrics.py
+    ## - File 3: option metrics -> option_metrics.py
 
-    Each run creates two CSV files:
-    - price: 5-day OHLCV history with snapshot metadata
-    - options: calls + puts for first 3 expiries with metadata
-
-    Designed for append-only scheduled runs.
-
-    """
     _BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-
     def __init__(self, ticker="AAPL", price_dir=None, options_dir=None):
-        self.ticker = ticker
+        ## Initialize paths, logger, timestamp metadata, and yfinance handle
+        self.ticker        = ticker
         self.snapshot_time = datetime.now()
-        self.snapshot_str = self.snapshot_time.strftime("%Y%m%d_%H%M%S")
-        self.price_dir = price_dir or os.path.join(self._BASE, "data", "raw", "price")
-        self.options_dir = options_dir or os.path.join(self._BASE, "data", "raw", "options")
+        self.snapshot_str  = self.snapshot_time.strftime("%Y%m%d_%H%M%S")
+        self.price_dir     = price_dir   or os.path.join(self._BASE, "data", "raw", "price")
+        self.options_dir   = options_dir or os.path.join(self._BASE, "data", "raw", "options")
 
-
-        os.makedirs(self.price_dir, exist_ok=True)
+        os.makedirs(self.price_dir,   exist_ok=True)
         os.makedirs(self.options_dir, exist_ok=True)
 
         self.logger = logging.getLogger(self.__class__.__name__)
         if not self.logger.handlers:
-            handler = logging.StreamHandler()
+            handler   = logging.StreamHandler()
             formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
             handler.setFormatter(formatter)
             self.logger.addHandler(handler)
@@ -45,122 +74,25 @@ class MarketSnapshotCollector:
     # ── HELPERS ───────────────────────────────────────────────────────────────
 
     def add_metadata(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Add snapshot_time, snapshot_str, and ticker columns to DataFrame."""
+        ## Tag every row with snapshot timestamp and ticker for downstream joins
         df = df.copy()
         df["snapshot_time"] = self.snapshot_time
-        df["snapshot_str"] = self.snapshot_str
-        df["ticker"] = self.ticker
+        df["snapshot_str"]  = self.snapshot_str
+        df["ticker"]        = self.ticker
         return df
 
     def save_dataframe(self, df: pd.DataFrame, path: str) -> None:
-        """Save DataFrame to timestamped CSV with error handling."""
+        ## Save DataFrame to CSV; log success or failure with shape
         try:
             df.to_csv(path, index=False)
-            self.logger.info(f"Saved file: {path} | shape={df.shape}")
+            self.logger.info(f"Saved: {path} | shape={df.shape}")
         except Exception as e:
             self.logger.error(f"Failed to save {path}: {e}")
-
-    def clean_price(self, df: pd.DataFrame) -> pd.DataFrame:       # ← FIXED indentation (extra space before def)
-        """Strip timezone, round prices, drop irrelevant columns."""
-        df["Date"] = pd.to_datetime(df["Date"]).dt.date
-        price_cols = ["Open", "High", "Low", "Close"]
-        df[price_cols] = df[price_cols].round(2)
-        df = df.drop(columns=["Dividends", "Stock Splits"], errors="ignore")
-        return df
-
-    def calculate_hv(self, df: pd.DataFrame) -> pd.DataFrame:      # ← FIXED indentation (extra space before def)
-        """Calculate 20-day and annualized historical volatility from Close prices."""
-        df["log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-        df["HV_20"] = df["log_return"].rolling(window=20).std() * np.sqrt(252)
-        df["HV_252"] = df["log_return"].rolling(window=252).std() * np.sqrt(252)
-        df = df.drop(columns=["log_return"])
-        df[["HV_20", "HV_252"]] = df[["HV_20", "HV_252"]].round(4)
-        return df
-
-    def calculate_greeks(self, df: pd.DataFrame, spot_price: float, r: float = 0.05) -> pd.DataFrame:
-        """Calculate Black-Scholes Greeks for each options contract row."""
-
-        # Make a copy so we don't modify the original DataFrame passed in
-        df = df.copy()
-
-        # Create empty lists to collect each Greek value row by row
-        greeks = {"delta": [], "gamma": [], "theta": [], "vega": []}
-
-        # Loop through every row — each row is one options contract
-        for _, row in df.iterrows():
-            try:
-                # Current stock price (same for every row, passed in from collect_options)
-                S = spot_price
-
-                # Strike price of this specific contract
-                K = row["strike"]
-
-                # Implied volatility returned by Yahoo Finance for this contract
-                sigma = row["impliedVolatility"]
-
-                # Time to expiry expressed as a fraction of a year
-                T = (pd.to_datetime(row["expiry"]) - pd.Timestamp.now()).days / 365
-
-                # Whether this row is a call or a put
-                option_type = row["option_type"]
-
-                # Guard: skip if inputs would cause divide-by-zero or nonsense
-                if T <= 0 or sigma <= 0 or K <= 0:
-                    raise ValueError("Invalid input values")
-
-                # d1: standardized distance between stock price and strike
-                d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-
-                # d2: d1 shifted down by one volatility unit
-                d2 = d1 - sigma * np.sqrt(T)
-
-                # Delta: how much option price moves per $1 move in stock
-                delta = norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1
-
-                # Gamma: how fast delta changes per $1 move in stock
-                gamma = norm.pdf(d1) / (S * sigma * np.sqrt(T))
-
-                # Theta: daily time decay (divided by 365 for daily)
-                if option_type == "call":
-                    theta = (
-                        (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)))
-                        - r * K * np.exp(-r * T) * norm.cdf(d2)
-                    ) / 365
-                else:
-                    theta = (
-                        (-S * norm.pdf(d1) * sigma / (2 * np.sqrt(T)))
-                        + r * K * np.exp(-r * T) * norm.cdf(-d2)
-                    ) / 365
-
-                # Vega: option price change per 1% move in IV
-                vega = S * norm.pdf(d1) * np.sqrt(T) / 100
-
-                # Append all four Greeks rounded to 4 decimal places
-                greeks["delta"].append(round(float(delta), 4))
-                greeks["gamma"].append(round(float(gamma), 4))
-                greeks["theta"].append(round(float(theta), 4))
-                greeks["vega"].append(round(float(vega), 4))
-
-
-            except Exception as e:
-                # Append None placeholders so the row still exists in output
-                self.logger.warning(f"Greeks failed for row: {e}")
-                greeks["delta"].append(None)
-                greeks["gamma"].append(None)
-                greeks["theta"].append(None)
-                greeks["vega"].append(None)
-
-        # Attach all four Greek lists as new columns
-        df["delta"] = greeks["delta"]
-        df["gamma"] = greeks["gamma"]
-        df["theta"] = greeks["theta"]
-        df["vega"] = greeks["vega"]
-        return df
 
     # ── COLLECTORS ────────────────────────────────────────────────────────────
 
     def collect_price(self) -> pd.DataFrame | None:
-        """Collect 5-day price history with HV. Returns DataFrame or None if failed/empty."""
+        ## Fetch 2y price history, compute HV, clean, tag metadata, save CSV
         try:
             prices = self.asset.history(period="2y")
             if prices.empty:
@@ -168,9 +100,8 @@ class MarketSnapshotCollector:
                 return None
 
             prices = prices.reset_index()
-            prices = self.calculate_hv(prices)  
-            prices = self.clean_price(prices)       #
-               
+            prices = calculate_hv(prices)
+            prices = clean_price(prices)
             prices = self.add_metadata(prices)
 
             path = f"{self.price_dir}/{self.ticker.lower()}_price_{self.snapshot_str}.csv"
@@ -181,8 +112,8 @@ class MarketSnapshotCollector:
             self.logger.error(f"Failed to collect price: {e}")
             return None
 
-    def collect_options(self, max_expiries=3) -> pd.DataFrame | None:
-        """Collect calls + puts with Greeks for first N expiries."""
+    def collect_options(self) -> pd.DataFrame | None:
+        ## Fetch full options chain (all expiries), compute Greeks, tag metadata, save CSV
         try:
             expiries = self.asset.options
         except Exception as e:
@@ -193,28 +124,35 @@ class MarketSnapshotCollector:
             self.logger.warning("No option expiries returned.")
             return None
 
-        # Get current stock price once for Greeks calculation
-        spot_price = self.asset.history(period="1d")["Close"].iloc[-1]  # ← ADDED
+        self.logger.info(f"Fetching {len(expiries)} expiries for {self.ticker}")
+
+        spot_price = self.asset.history(period="1d")["Close"].iloc[-1]
+        self.logger.info(f"Spot price: {spot_price:.2f}")
 
         options_list = []
-        for expiry in expiries[:max_expiries]:
+
+        for expiry in expiries:                          ## no slice — all expiries
             try:
                 chain = self.asset.option_chain(expiry)
 
                 calls = chain.calls.copy()
-                calls["expiry"] = expiry
+                calls["expiry"]      = expiry
                 calls["option_type"] = "call"
 
                 puts = chain.puts.copy()
-                puts["expiry"] = expiry
+                puts["expiry"]      = expiry
                 puts["option_type"] = "put"
 
                 combined = pd.concat([calls, puts], ignore_index=True)
-                combined = self.calculate_greeks(combined, spot_price=spot_price)   # ← ADDED
+                combined = calculate_greeks(
+                    combined,
+                    spot_price=spot_price,
+                    logger=self.logger          ## pass logger so Greeks failures appear in log
+                )
                 combined = self.add_metadata(combined)
                 options_list.append(combined)
 
-                self.logger.info(f"Collected options for expiry {expiry} | rows={combined.shape[0]}")
+                self.logger.info(f"Collected expiry {expiry} | rows={combined.shape[0]}")
 
             except Exception as e:
                 self.logger.error(f"Failed to collect options for expiry {expiry}: {e}")
@@ -226,7 +164,6 @@ class MarketSnapshotCollector:
 
         options_df = pd.concat(options_list, ignore_index=True)
 
-        # Updated schema includes Greeks, removes junk columns
         keep_cols = [
             "contractSymbol", "expiry", "option_type", "strike",
             "bid", "ask", "lastPrice", "volume", "openInterest",
@@ -234,22 +171,49 @@ class MarketSnapshotCollector:
             "inTheMoney", "snapshot_time", "snapshot_str", "ticker"
         ]
         existing_cols = [col for col in keep_cols if col in options_df.columns]
-        options_df = options_df[existing_cols]
+        options_df    = options_df[existing_cols]
+
+        self.logger.info(f"Total options collected | rows={options_df.shape[0]} contracts={options_df['contractSymbol'].nunique()}")
 
         path = f"{self.options_dir}/{self.ticker.lower()}_options_{self.snapshot_str}.csv"
         self.save_dataframe(options_df, path)
         return options_df
 
+    def is_market_open(self) -> bool:
+        ## Returns True on weekdays that are not US market holidays
+        now   = datetime.now()
+        today = now.date()
+        if today in MARKET_HOLIDAYS:
+            return False
+        return now.weekday() < 5
+
     # ── ORCHESTRATOR ──────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """Execute full pipeline: price + options collection."""
-        self.logger.info(f"Starting snapshot run for {self.ticker} | snapshot={self.snapshot_str}")
+        ## Entry point — check market, then collect price and options in sequence
+        if not self.is_market_open():
+            self.logger.info("Market closed. Skipping snapshot run.")
+            return
+
+        self.logger.info(f"Starting snapshot run | ticker={self.ticker} | snapshot={self.snapshot_str}")
         self.collect_price()
-        self.collect_options(max_expiries=3)
+        self.collect_options()
         self.logger.info("Snapshot run complete.")
 
 
 if __name__ == "__main__":
-    collector = MarketSnapshotCollector(ticker="AAPL")
-    collector.run()
+    for ticker in TICKERS:
+        collector = MarketSnapshotCollector(ticker=ticker)
+        collector.run()
+
+    ## Run database pipeline after all tickers collected
+    pipeline_dir = os.path.dirname(os.path.abspath(__file__))
+    python       = "/opt/anaconda3/bin/python3"
+
+    logging.info("Running build_database.py...")
+    subprocess.run([python, os.path.join(pipeline_dir, "build_database.py")], check=True)
+
+    logging.info("Running build_silver.py...")
+    subprocess.run([python, os.path.join(pipeline_dir, "build_silver.py")], check=True)
+
+    logging.info("Pipeline complete — Gold tables updated.")

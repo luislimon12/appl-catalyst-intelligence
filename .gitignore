@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# DuckDB databases — local data, do not push
+*.duckdb
+*.duckdb.wal
+
+# Raw data CSVs — too large for git
+data/raw/price/*.csv
+data/raw/options/*.csv
