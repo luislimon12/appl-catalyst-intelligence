@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from datetime import date as date_type
 import pandas
+import plotly.graph_objects as go
 import streamlit as st
 
 from utils import DARK_THEME_CSS, format_expiry, get_spot_price, query, render_sidebar
@@ -27,6 +28,69 @@ st.caption("Full chain filterable by expiry, type, and strike range")
 st.divider()
 
 # ── Data ──────────────────────────────────────────────────────────────────────
+def get_iv_skew(ticker, expiry):
+    """Fetch IV by strike split by call/put for the skew chart."""
+    if expiry == "ALL":
+        return pandas.DataFrame()
+    return query(
+        """
+        SELECT strike, option_type, iv
+        FROM gold_latest_snapshot
+        WHERE ticker = ? AND expiry = ? AND iv IS NOT NULL AND iv > 0
+        ORDER BY strike
+        """, [ticker, expiry]
+    )
+
+def render_skew_chart(ticker, expiry, spot):
+    """IV skew — calls vs puts IV plotted against strike.
+    Blue line = call IV, red line = put IV.
+    A higher put IV than call IV at the same strike = bearish skew (market hedging downside).
+    """
+    df = get_iv_skew(ticker, expiry)
+    if df.empty:
+        return  # silently skip if ALL selected or no data
+
+    calls = df[df["option_type"] == "call"]
+    puts  = df[df["option_type"] == "put"]
+
+    fig = go.Figure()
+
+    # Call IV line — blue
+    fig.add_trace(go.Scatter(
+        x=calls["strike"], y=calls["iv"] * 100,
+        mode="lines+markers", name="Calls",
+        line=dict(color="#388bfd", width=2), marker=dict(size=5),
+        hovertemplate="Strike: $%{x}<br>Call IV: %{y:.1f}%<extra></extra>",
+    ))
+
+    # Put IV line — red
+    fig.add_trace(go.Scatter(
+        x=puts["strike"], y=puts["iv"] * 100,
+        mode="lines+markers", name="Puts",
+        line=dict(color="#f85149", width=2), marker=dict(size=5),
+        hovertemplate="Strike: $%{x}<br>Put IV: %{y:.1f}%<extra></extra>",
+    ))
+
+    # Spot price vertical line — shows where ATM is on the skew
+    fig.add_vline(x=spot, line_width=2, line_dash="dash", line_color="#f0c040")
+    fig.add_annotation(
+        x=spot, y=1, yref="paper", text=f"Spot ${spot:.2f}",
+        showarrow=False, font=dict(color="#f0c040", size=11),
+        bgcolor="#0e1117", bordercolor="#f0c040", borderwidth=1,
+        xanchor="left", yanchor="top"
+    )
+
+    fig.update_layout(
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0",
+        height=300, margin=dict(t=20, b=40, l=60, r=20),
+        xaxis=dict(title="Strike", tickprefix="$", gridcolor="#21262d", color="#8b949e"),
+        yaxis=dict(title="IV %", gridcolor="#21262d", color="#8b949e", zeroline=False),
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
+        hovermode="x unified",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"IV Skew · {format_expiry(expiry)} · Blue = Calls · Red = Puts · Spot marked in yellow")
+
 def get_chain_data(ticker, expiry, option_type, spot, pct_range):
     sql = "SELECT * FROM gold_latest_snapshot WHERE ticker = ?"
     params = [ticker]
@@ -67,6 +131,11 @@ with ctrl2:
 
 with ctrl3:
     pct_range = st.slider("Strike range (±%)", min_value=5, max_value=30, value=10, step=5, key="chain_pct")
+
+# IV Skew chart — driven by the same expiry selector above, sits above the chain table
+st.subheader("📉 IV Skew")
+render_skew_chart(ticker, selected_expiry, spot)
+st.divider()
 
 df = get_chain_data(ticker, selected_expiry, option_type, spot, pct_range)
 

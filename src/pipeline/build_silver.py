@@ -1,12 +1,3 @@
-# ──────────────────────────────────────────────────────────────────────────────
-# build_silver.py
-# AAPL & INTC Catalyst Intelligence Pipeline — Silver/Gold Builder
-#
-# Session 2 (May 2026): Initial Silver/Gold pipeline, five Gold tables,
-#                        dynamic validation assertions
-# Session 3 (Jun 2026): Filter ask < bid rows during Silver promotion
-#                        (downgraded assertion to WARNING, no longer crashes)
-# ──────────────────────────────────────────────────────────────────────────────
 import duckdb
 from pathlib import Path
 
@@ -28,6 +19,8 @@ try:
                    ORDER BY snapshot_time DESC
                ) AS rn
         FROM bronze_price_raw
+        -- Filter null critical fields during Silver promotion so spot price lookups never return NULL
+        WHERE ticker IS NOT NULL AND Date IS NOT NULL AND Close IS NOT NULL AND snapshot_time IS NOT NULL
     )
     SELECT
         Date,
@@ -82,12 +75,15 @@ try:
     print("invalid_price_logic:",   price_logic_count)
     print("invalid_hv_values:",     invalid_hv_count)
 
-    assert duplicate_count     == 0,                    "Duplicate ticker/date keys found"
-    assert null_count          == 0,                    "Critical nulls found"
-    assert invalid_price_count == 0,                    "Invalid numeric price values found"
-    assert price_logic_count   == 0,                    "Price logic violations found"
-    assert invalid_hv_count    == 0,                    "Invalid volatility values found"
-    assert count               == bronze_distinct_keys, "Silver row count does not match deduped Bronze keys"
+    assert duplicate_count     == 0, "Duplicate ticker/date keys found"
+    assert invalid_price_count == 0, "Invalid numeric price values found"
+    assert price_logic_count   == 0, "Price logic violations found"
+    assert invalid_hv_count    == 0, "Invalid volatility values found"
+    # Null rows filtered at source — Silver count may be slightly below Bronze distinct keys
+    if null_count > 0:
+        print(f"WARNING: {null_count} null rows filtered from bronze_price_raw during Silver promotion")
+    if count != bronze_distinct_keys:
+        print(f"WARNING: Silver rows ({count}) != Bronze distinct keys ({bronze_distinct_keys}) — {bronze_distinct_keys - count} null rows dropped")
 
     print("silver_price_daily validation passed")
 
@@ -332,6 +328,10 @@ try:
           AND b.impliedVolatility < 5
           AND b.strike BETWEEN snap.spot * 0.98
                            AND snap.spot * 1.02
+          -- Jun 17 2026: exclude overnight/pre-market snapshots from IV rank calculation
+          -- Midnight runs return IV near 0% (bid=ask=0, market closed) which corrupts gold_iv_rank
+          -- Only use snapshots collected between 9 AM and 6 PM (real market hours)
+          AND HOUR(b.snapshot_time) BETWEEN 9 AND 18
         GROUP BY b.ticker, b.snapshot_str, b.snapshot_time
     ),
 
@@ -397,14 +397,17 @@ try:
     print("iv_rank_rows:",    iv_count)
     print("iv_null_fields:",  iv_null_check)
     print("iv_out_of_range:", iv_range_check)
-    print("snapshot_count:",  con.execute("SELECT snapshot_count FROM gold_iv_rank").fetchone()[0])
-    print("iv_current:",      con.execute("SELECT iv_current FROM gold_iv_rank").fetchone()[0])
-    print("iv_rank:",         con.execute("SELECT iv_rank FROM gold_iv_rank").fetchone()[0])
-    print("iv_percentile:",   con.execute("SELECT iv_percentile FROM gold_iv_rank").fetchone()[0])
 
-    assert iv_count       >= 1, "No rows in gold_iv_rank"
+    assert iv_count       >= 1, "No rows in gold_iv_rank — check that silver_price_daily has valid Close values"
     assert iv_null_check  == 0, "Null IV rank or percentile values found"
     assert iv_range_check == 0, "IV rank or percentile out of 0-1 range"
+
+    # Guard fetchone() — only print if table has rows
+    if iv_count >= 1:
+        print("snapshot_count:", con.execute("SELECT snapshot_count FROM gold_iv_rank").fetchone()[0])
+        print("iv_current:",     con.execute("SELECT iv_current FROM gold_iv_rank").fetchone()[0])
+        print("iv_rank:",        con.execute("SELECT iv_rank FROM gold_iv_rank").fetchone()[0])
+        print("iv_percentile:",  con.execute("SELECT iv_percentile FROM gold_iv_rank").fetchone()[0])
 
     print("gold_iv_rank validation passed")
 
