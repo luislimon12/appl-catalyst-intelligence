@@ -224,3 +224,7 @@ __marimo__/
 # Raw data CSVs — too large for git
 data/raw/price/*.csv
 data/raw/options/*.csv
+
+# macOS
+.DS_Store
+com.catalyst.snapshot.plist

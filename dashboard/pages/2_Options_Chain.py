@@ -13,7 +13,7 @@ import pandas
 import plotly.graph_objects as go
 import streamlit as st
 
-from utils import DARK_THEME_CSS, format_expiry, get_spot_price, query, render_sidebar
+from utils import DARK_THEME_CSS, format_expiry, get_spot_price, query, render_sidebar, render_page_header
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Options Chain · Catalyst Intelligence", page_icon="📋", layout="wide", initial_sidebar_state="expanded")
@@ -23,9 +23,7 @@ st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 ticker, refresh_secs = render_sidebar("Options Chain")
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title(f"📋 Options Chain — {ticker}")
-st.caption("Full chain filterable by expiry, type, and strike range")
-st.divider()
+render_page_header("📋", "Options Chain", "Full chain filterable by expiry, type, and strike range", ticker)
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 def get_iv_skew(ticker, expiry):
@@ -143,7 +141,9 @@ if df.empty:
     st.warning("No contracts found for these filters.")
     st.stop()
 
-display = df[["expiry","strike","option_type","inTheMoney","bid","ask","option_last","volume","openInterest","iv","delta","gamma","theta","vega"]].copy()
+## Jun 21 2026: reordered columns — most important (Strike, Last, IV%, Delta) first
+## so they're visible without scrolling on smaller screens
+display = df[["strike","option_type","option_last","iv","delta","bid","ask","volume","openInterest","gamma","theta","vega","expiry","inTheMoney"]].copy()
 display["expiry"]      = display["expiry"].astype(str).str[:10].apply(format_expiry)
 display["iv"]          = (display["iv"] * 100).round(2)
 display["option_type"] = display["option_type"].str.capitalize()

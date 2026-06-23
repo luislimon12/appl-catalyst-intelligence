@@ -21,6 +21,7 @@ import streamlit as st
 from utils import (
     CATALYST_EVENTS, DARK_THEME_CSS,
     format_expiry, get_spot_price, pcr_color,
+    bull_color, bear_color, render_page_header,
     query, render_sidebar,
 )
 
@@ -37,9 +38,7 @@ st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 ticker, refresh_secs = render_sidebar("Market Overview")
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title(f"📈 Market Overview — {ticker}")
-st.caption("IV Rank · Put/Call Ratio · Gamma Exposure")
-st.divider()
+render_page_header("📈", "Market Overview", "IV Rank · Put/Call Ratio · Gamma Exposure", ticker)
 
 # ── IV Rank ───────────────────────────────────────────────────────────────────
 def render_iv_rank(ticker: str):
@@ -162,35 +161,93 @@ def render_gex(ticker: str):
     selected_label  = st.selectbox("Expiry", expiry_labels, index=0, key="gex_expiry")
     selected_expiry = expiry_options[expiry_labels.index(selected_label)]
 
+    ## Jun 21 2026: fetch call, put, and net GEX separately so we can show split bars
     if selected_expiry == "ALL":
-        df = query("SELECT strike, SUM(net_gamma_notional) AS net_gamma_notional FROM gold_greeks_exposure WHERE ticker = ? GROUP BY strike ORDER BY strike", [ticker])
+        df = query("""
+            SELECT strike,
+                   SUM(call_gamma_notional) AS call_gex,  -- dealer gamma from calls at this strike
+                   SUM(put_gamma_notional)  AS put_gex,   -- dealer gamma from puts at this strike
+                   SUM(net_gamma_notional)  AS net_gex    -- net = call + put combined
+            FROM gold_greeks_exposure WHERE ticker = ?
+            GROUP BY strike ORDER BY strike
+        """, [ticker])
     else:
-        df = query("SELECT strike, net_gamma_notional FROM gold_greeks_exposure WHERE ticker = ? AND expiry = ? ORDER BY strike", [ticker, selected_expiry])
+        df = query("""
+            SELECT strike,
+                   call_gamma_notional AS call_gex,  -- dealer gamma from calls at this strike
+                   put_gamma_notional  AS put_gex,   -- dealer gamma from puts at this strike
+                   net_gamma_notional  AS net_gex    -- net = call + put combined
+            FROM gold_greeks_exposure WHERE ticker = ? AND expiry = ?
+            ORDER BY strike
+        """, [ticker, selected_expiry])
 
     if df.empty:
         st.warning("No GEX data for this expiry.")
         return
 
     df = df.copy()
-    lower, upper = spot * 0.80, spot * 1.20
-    df = df[(df["strike"] >= lower) & (df["strike"] <= upper)]
-    df["gex_k"] = df["net_gamma_notional"] / 1000
-    bar_colors = ["#388bfd" if v >= 0 else "#f85149" for v in df["gex_k"]]
+    lower, upper = spot * 0.80, spot * 1.20                ## limit to ±20% of spot
+    df = df[(df["strike"] >= lower) & (df["strike"] <= upper)]  ## filter strikes
+
+    ## Scale from dollars to $K so y-axis numbers are readable (22000 → 22.0)
+    df["call_gex_k"] = df["call_gex"] / 1000   ## call GEX in thousands
+    df["put_gex_k"]  = df["put_gex"]  / 1000   ## put GEX in thousands
+    df["net_gex_k"]  = df["net_gex"]  / 1000   ## net GEX in thousands
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=df["strike"], y=df["gex_k"], marker_color=bar_colors, name="Net GEX", hovertemplate="Strike: $%{x}<br>GEX: $%{y:.1f}K<extra></extra>"))
+
+    ## Blue bars = call GEX — dealer gamma from call contracts at each strike
+    ## Positive = dealers are long gamma here (stabilizing — they sell into rallies)
+    fig.add_trace(go.Bar(
+        x=df["strike"],           ## x-axis = strike price
+        y=df["call_gex_k"],       ## height = call GEX in $K
+        name="Call GEX",          ## legend label
+        marker_color="#388bfd",   ## blue — calls
+        opacity=0.8,              ## slight transparency so bars don't overpower
+        hovertemplate="Strike: $%{x}<br>Call GEX: $%{y:.1f}K<extra></extra>",
+    ))
+
+    ## Orange bars = put GEX — dealer gamma from put contracts at each strike
+    ## Negative = dealers are short gamma here (destabilizing — they sell into drops)
+    fig.add_trace(go.Bar(
+        x=df["strike"],           ## x-axis = strike price
+        y=df["put_gex_k"],        ## height = put GEX in $K (typically negative)
+        name="Put GEX",           ## legend label
+        marker_color="#f0a500",   ## orange — puts
+        opacity=0.8,              ## slight transparency
+        hovertemplate="Strike: $%{x}<br>Put GEX: $%{y:.1f}K<extra></extra>",
+    ))
+
+    ## White dotted line = net GEX — where call and put gamma cancel out
+    ## Zero crossing = gamma flip point — price tends to accelerate past this level
+    fig.add_trace(go.Scatter(
+        x=df["strike"],                                     ## x-axis = strike price
+        y=df["net_gex_k"],                                  ## y = net GEX in $K
+        name="Net GEX",                                     ## legend label
+        mode="lines",                                       ## line only, no dots
+        line=dict(color="#e0e0e0", width=2, dash="dot"),    ## white dotted line
+        hovertemplate="Strike: $%{x}<br>Net GEX: $%{y:.1f}K<extra></extra>",
+    ))
+
+    ## Spot price vertical line — shows current price relative to gamma walls
     fig.add_vline(x=spot, line_width=2, line_dash="dash", line_color="#f0c040")
-    fig.add_annotation(x=spot, y=1, yref="paper", text=f"Spot ${spot:.2f}", showarrow=False,
-        font=dict(color="#f0c040", size=12), bgcolor="#0e1117", bordercolor="#f0c040", borderwidth=1, xanchor="left", yanchor="top")
+    fig.add_annotation(
+        x=spot, y=1, yref="paper", text=f"Spot ${spot:.2f}", showarrow=False,
+        font=dict(color="#f0c040", size=12), bgcolor="#0e1117",
+        bordercolor="#f0c040", borderwidth=1, xanchor="left", yanchor="top"
+    )
+
     fig.update_layout(
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0", height=400,
         margin=dict(t=40, b=40, l=60, r=20),
+        barmode="group",   ## side-by-side bars — easier to compare call vs put GEX per strike
         xaxis=dict(title="Strike", tickprefix="$", gridcolor="#21262d", color="#8b949e"),
         yaxis=dict(title="GEX ($K)", gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d", zerolinewidth=2),
-        showlegend=False, bargap=0.2,
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
+        bargap=0.15,   ## small gap between strike groups
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"Spot: ${spot:.2f} · Strikes shown: ±20% of spot · Net gamma exposure in $K notional dollars")
+    st.caption(f"Spot: ${spot:.2f} · Blue = Call GEX · Orange = Put GEX · Dotted = Net · ±20% of spot")
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 col1, col2 = st.columns([1, 2])
