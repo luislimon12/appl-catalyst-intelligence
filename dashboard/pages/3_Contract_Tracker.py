@@ -37,15 +37,62 @@ def get_watchlist_contracts(ticker):
         """, [ticker]
     )
 
-def get_contract_history(symbol):
-    return query(
+def get_contract_history(symbol, metric_col="lastPrice"):
+    ## Jun 25 2026: metric-aware snapshot filtering
+    ##
+    ## PROBLEM:
+    ##   Multiple snapshots per day (9:35 AM + 4:15 PM + manual Refresh Data clicks)
+    ##   created zigzag lines when plotting IV and Delta — same x position, different y values.
+    ##
+    ## SOLUTION — different filter per metric:
+    ##
+    ##   PRICE → show ALL market-hours snapshots (no daily dedup)
+    ##     Reason: AM (open) and PM (close) are both meaningful for price.
+    ##     Two dots per day = you can see intraday movement.
+    ##     This is the same data the candlestick uses (open = AM, close = PM).
+    ##
+    ##   IV / DELTA → one snapshot per day (latest only)
+    ##     Reason: IV and Delta don't need intraday resolution on a line chart.
+    ##     Multiple snapshots same day create false zigzags (e.g. IV: 27% → 5% → 27%
+    ##     within 10 minutes because of test button clicks). One daily dot = clean trend line.
+    ##     We pick the LATEST snapshot because it has end-of-day settled values.
+
+    if metric_col == "lastPrice":
+        ## Price: no daily dedup — show AM + PM snapshots so line reflects intraday moves
+        ## HOUR filter still applies to exclude midnight (stale) snapshots
+        daily_dedup_filter = ""
+    else:
+        ## IV / Delta: deduplicate to one row per calendar day — the latest market-hours snapshot
+        ## Correlated subquery: for each row b, check if its snapshot_time equals the
+        ## MAX snapshot_time on the same date for the same contract.
+        ## Only rows that match (i.e. the latest snapshot that day) pass through.
+        daily_dedup_filter = """
+            AND snapshot_time = (
+                SELECT MAX(b2.snapshot_time)                          -- latest snapshot this day
+                FROM bronze_options_raw b2
+                WHERE b2.contractSymbol = b.contractSymbol            -- same contract
+                AND DATE(b2.snapshot_time) = DATE(b.snapshot_time)    -- same calendar day
+                AND HOUR(b2.snapshot_time) BETWEEN 9 AND 18          -- market hours only
+            )
         """
+
+    return query(
+        f"""
         SELECT snapshot_time, lastPrice, impliedVolatility, delta, volume, openInterest
-        FROM bronze_options_raw WHERE contractSymbol = ?
-        -- Jun 17 2026: filter overnight/pre-market snapshots (midnight runs return stale IV near 0%)
-        -- Only include market-hours data (9 AM–6 PM) so Price, IV, and Delta charts show real quotes
+        FROM bronze_options_raw b
+        WHERE contractSymbol = ?
+
+        -- Jun 17 2026: exclude overnight/pre-market snapshots
+        -- Midnight runs return IV near 0% (bid=ask=0, market closed) — corrupts the chart
+        -- Only keep snapshots between 9 AM and 6 PM
         AND HOUR(snapshot_time) BETWEEN 9 AND 18
-        ORDER BY snapshot_time
+
+        -- Jun 25 2026: injected dynamically based on metric_col
+        -- Empty string for Price (show all snapshots)
+        -- Correlated subquery for IV/Delta (one point per day, latest only)
+        {daily_dedup_filter}
+
+        ORDER BY snapshot_time  -- chronological so line connects left to right
         """, [symbol]
     )
 
@@ -324,14 +371,11 @@ with ctrl_a:
     chart_type = st.radio("Chart type", ["Line", "Candlestick"], horizontal=True, key="tracker_chart_type")
 
 with ctrl_b:
-    metric_map = {
-        "Price": ("lastPrice",         "Price ($)"),
-        "IV":    ("impliedVolatility", "IV %"),
-        "Delta": ("delta",             "Delta"),
-    }
+    ## Jun 25 2026: replaced single-metric radio with dual-axis toggle + Delta option
+    ## Price + IV always shown together on dual-axis chart (Price left, IV right)
+    ## Delta kept as a separate toggle since it doesn't pair naturally with price
     if chart_type == "Line":
-        metric_label = st.radio("Metric", list(metric_map.keys()), horizontal=True, key="tracker_metric")
-        metric_col, y_label = metric_map[metric_label]
+        show_delta = st.radio("Overlay", ["Price + IV", "Delta"], horizontal=True, key="tracker_metric")
 
 with ctrl_c:
     # Timeframe selector — shared across both line and candlestick chart types
@@ -364,38 +408,114 @@ if chart_type == "Candlestick":
     render_candlestick(st.session_state["watchlist"][0], timeframe_days=timeframe_days)
 else:
     fig    = go.Figure()
-    colors = ["#388bfd","#f0c040","#2ea043","#f85149","#bc8cff","#79c0ff"]
+    colors = ["#388bfd","#f0c040","#2ea043","#f85149","#bc8cff","#79c0ff"]  ## color cycle for multiple contracts
 
     for i, symbol in enumerate(st.session_state["watchlist"]):
-        df = get_contract_history(symbol)
-        if df.empty or metric_col not in df.columns:
-            continue
-        df = df.dropna(subset=[metric_col])
+        color = colors[i % len(colors)]  ## cycle through colors for each contract
 
-        # Apply timeframe filter — slice to last N days from most recent snapshot
-        # Why from most recent snapshot not today: avoids empty charts on weekends/holidays
-        if timeframe_days is not None:
-            cutoff = pandas.to_datetime(df["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
-            df = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]
-        color   = colors[i % len(colors)]
-        y_vals  = df[metric_col] * 100 if metric_col == "impliedVolatility" else df[metric_col]
-        h_fmt   = ".2f%" if metric_col == "impliedVolatility" else ".4f"
+        if show_delta == "Delta":
+            ## Jun 25 2026: Delta mode — single metric, one point per day (latest snapshot)
+            ## Delta doesn't pair naturally with price so it gets its own single-axis chart
+            df = get_contract_history(symbol, metric_col="delta")
+            if df.empty:
+                continue
+            df = df.dropna(subset=["delta"])
 
-        fig.add_trace(go.Scatter(
-            x=df["snapshot_time"], y=y_vals, mode="lines+markers", name=symbol,
-            line=dict(color=color, width=2), marker=dict(size=6),
-            hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>{metric_label}: %{{y:{h_fmt}}}<extra></extra>",
-        ))
+            ## Apply timeframe filter — slice from most recent snapshot backwards
+            if timeframe_days is not None:
+                cutoff = pandas.to_datetime(df["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
+                df = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]
 
-    ## Cap x-axis 30 days past last data point — stops catalyst markers from stretching chart to Sep
-    x_start = pandas.to_datetime(df["snapshot_time"]).min()
-    x_end   = pandas.to_datetime(df["snapshot_time"]).max() + pandas.Timedelta(days=30)
+            ## Single delta trace on left y-axis
+            fig.add_trace(go.Scatter(
+                x=df["snapshot_time"], y=df["delta"],
+                name=f"{symbol} Delta", mode="lines+markers",
+                line=dict(color=color, width=2), marker=dict(size=5),
+                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>Delta: %{{y:.4f}}<extra></extra>",
+            ))
 
+            ## x-axis range caps
+            x_start = pandas.to_datetime(df["snapshot_time"]).min()
+            x_end   = pandas.to_datetime(df["snapshot_time"]).max() + pandas.Timedelta(days=30)
+
+            fig.update_layout(
+                yaxis=dict(title="Delta", gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d"),
+            )
+
+        else:
+            ## Jun 25 2026: Price + IV dual-axis mode
+            ## Price (left y-axis, blue) + IV (right y-axis, yellow dotted)
+            ## Lets you see IV crush and price reaction together — most important options relationship
+
+            ## Price — all market-hours snapshots so AM + PM both show (intraday moves visible)
+            df_price = get_contract_history(symbol, metric_col="lastPrice")
+            if df_price.empty:
+                continue
+            df_price = df_price.dropna(subset=["lastPrice"])
+
+            ## IV — one snapshot per day (latest only) so no zigzag from multiple daily runs
+            df_iv = get_contract_history(symbol, metric_col="impliedVolatility")
+            if df_iv.empty:
+                continue
+            df_iv = df_iv.dropna(subset=["impliedVolatility"])
+
+            ## Apply timeframe filter to both dataframes independently
+            if timeframe_days is not None:
+                cutoff_p = pandas.to_datetime(df_price["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
+                df_price = df_price[pandas.to_datetime(df_price["snapshot_time"]) >= cutoff_p]
+                cutoff_i = pandas.to_datetime(df_iv["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
+                df_iv    = df_iv[pandas.to_datetime(df_iv["snapshot_time"]) >= cutoff_i]
+
+            ## Price trace — left y-axis (yaxis="y1"), solid line
+            fig.add_trace(go.Scatter(
+                x=df_price["snapshot_time"],   ## x = snapshot timestamp
+                y=df_price["lastPrice"],        ## y = option last price in dollars
+                name=f"{symbol} Price",         ## legend label
+                mode="lines+markers",           ## line + dots at each snapshot
+                line=dict(color=color, width=2),
+                marker=dict(size=5),
+                yaxis="y1",                     ## bind to left y-axis
+                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>Price: $%{{y:.2f}}<extra></extra>",
+            ))
+
+            ## IV trace — right y-axis (yaxis="y2"), dotted yellow line
+            ## Dotted so it's visually distinct from price even without looking at legend
+            ## Multiplied by 100 to convert decimal (0.27) to percentage (27%)
+            fig.add_trace(go.Scatter(
+                x=df_iv["snapshot_time"],              ## x = snapshot timestamp
+                y=df_iv["impliedVolatility"] * 100,    ## y = IV as percentage
+                name=f"{symbol} IV %",                 ## legend label
+                mode="lines+markers",
+                line=dict(color="#f0c040", width=2, dash="dot"),  ## yellow dotted — matches IV theme throughout dashboard
+                marker=dict(size=5),
+                yaxis="y2",                            ## bind to RIGHT y-axis
+                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>IV: %{{y:.1f}}%<extra></extra>",
+            ))
+
+            ## x-axis range — cap 30 days past last data point
+            x_start = pandas.to_datetime(df_price["snapshot_time"]).min()
+            x_end   = pandas.to_datetime(df_price["snapshot_time"]).max() + pandas.Timedelta(days=30)
+
+            fig.update_layout(
+                ## Left y-axis — Price
+                yaxis=dict(title="Price ($)", gridcolor="#21262d", color="#8b949e", zeroline=False),
+                ## Right y-axis — IV %
+                ## overlaying="y" places it on the same chart area as the left axis
+                ## side="right" pins it to the right edge
+                ## showgrid=False prevents a second grid from overlapping the left grid
+                yaxis2=dict(
+                    title="IV %", overlaying="y", side="right",
+                    color="#f0c040",   ## yellow to match IV line color
+                    showgrid=False,    ## no second grid — would overlap left axis grid
+                    zeroline=False,
+                ),
+            )
+
+    ## Shared layout applied regardless of Price+IV or Delta mode
     fig.update_layout(
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0", height=400,
         margin=dict(t=20, b=40, l=60, r=20),
         xaxis=dict(title="Snapshot Time", gridcolor="#21262d", color="#8b949e", range=[x_start, x_end]),
-        yaxis=dict(title=y_label, gridcolor="#21262d", color="#8b949e", zeroline=False),
         legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
         hovermode="x unified",
     )
