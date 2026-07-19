@@ -364,6 +364,24 @@ try:
         FROM atm_iv_per_snapshot a
         JOIN iv_stats s ON s.ticker = a.ticker
         GROUP BY a.ticker
+    ),
+
+    iv_zscore AS (
+        -- Z-Score = (current IV - mean IV) / standard deviation across all snapshots
+        -- measures how many std deviations today's IV is from its own historical average
+        -- > +2.0 = IV is statistically expensive = premium selling zone
+        -- < -2.0 = IV is statistically cheap = good for buying options / LEAPS
+        -- STDDEV_POP = population std dev (uses all snapshots, not a sample)
+        -- NULLIF(..., 0) prevents division by zero when only one snapshot exists
+        SELECT
+            a.ticker,
+            ROUND(
+                (s.iv_current - AVG(a.atm_iv))          -- distance from historical mean
+              / NULLIF(STDDEV_POP(a.atm_iv), 0),         -- divided by population std dev
+            4)                                           AS iv_zscore
+        FROM atm_iv_per_snapshot a
+        JOIN iv_stats s ON s.ticker = a.ticker           -- join to get iv_current
+        GROUP BY a.ticker, s.iv_current                  -- group by ticker + current IV
     )
 
     SELECT
@@ -376,11 +394,13 @@ try:
           / NULLIF(s.iv_max - s.iv_min, 0),
         4)                                                       AS iv_rank,
         p.iv_percentile,
+        z.iv_zscore,                                             -- Jul 2026: added Z-score column
         s.snapshot_count,
         (SELECT MAX(snapshot_time) FROM atm_iv_per_snapshot
          WHERE ticker = s.ticker)                                AS snapshot_time
     FROM iv_stats s
     JOIN iv_percentile p ON p.ticker = s.ticker
+    JOIN iv_zscore     z ON z.ticker = s.ticker                  -- join Z-score CTE
     """)
 
     iv_count       = con.execute("SELECT COUNT(*) FROM gold_iv_rank").fetchone()[0]

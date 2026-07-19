@@ -8,12 +8,59 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas
-import plotly.graph_objects as go
-import streamlit as st
-from plotly.subplots import make_subplots
+import json                                ## built-in Python library for reading/writing JSON files
+import pandas                              ## data manipulation
+import plotly.graph_objects as go         ## plotly charts
+import streamlit as st                    ## dashboard framework
+from plotly.subplots import make_subplots ## multi-row chart layouts
 
 from utils import CATALYST_EVENTS, DARK_THEME_CSS, bull_color, bear_color, format_expiry, query, render_sidebar, render_page_header
+
+# ── Watchlist persistence ─────────────────────────────────────────────────────
+WATCHLIST_FILE = Path(__file__).parent.parent / "watchlist.json"
+## Path(__file__)      = absolute path to this file (3_Contract_Tracker.py)
+## .parent             = goes up one level → pages/ folder
+## .parent.parent      = goes up another level → project root
+## / "watchlist.json"  = appends filename → project_root/watchlist.json
+
+def load_ohlc_override(symbol: str, date: str) -> dict:
+    ## read manual H/L correction from DB — pure read, uses existing read-only connection
+    ## called inside get_today_ohlc() to merge user-corrected values over synthesised ones
+    ## try/except: if table doesn't exist yet (script never run), returns {} safely
+    try:
+        df = query(
+            """
+            SELECT high, low FROM manual_ohlc_overrides
+            WHERE symbol = ? AND date = CAST(? AS DATE)
+            """,
+            [symbol, date[:10]]   ## [:10] strips any midnight timestamp → "2026-07-13" only
+        )
+        if df.empty:
+            return {}             ## no override saved for this symbol+date
+        return df.iloc[0].to_dict()  ## {"high": 4.80, "low": 3.60}
+    except Exception:
+        return {}                 ## table doesn't exist yet — fall back to synthesised values
+
+def load_watchlist(ticker: str) -> list:
+    ## called on page load to restore saved contracts from disk
+    ## ticker: str = "AAPL" or "INTC" — loads only that ticker's contracts
+    ## -> list     = always returns a list (empty if nothing saved yet)
+    if not WATCHLIST_FILE.exists():          ## check if file exists — first run it won't
+        return []                            ## no file yet = empty watchlist
+    with open(WATCHLIST_FILE, "r") as f:     ## open file in read mode
+        data = json.load(f)                  ## json.load parses the file text into a Python dict
+    return data.get(ticker, [])              ## .get(ticker, []) = return this ticker's list or [] if missing
+
+def save_watchlist(ticker: str, watchlist: list):
+    ## called every time user adds or removes a contract
+    ## writes the updated list to disk so it survives restarts
+    data = {}                                ## start with empty dict
+    if WATCHLIST_FILE.exists():              ## if file already exists, load it first
+        with open(WATCHLIST_FILE, "r") as f:
+            data = json.load(f)              ## load existing data so other tickers aren't erased
+    data[ticker] = watchlist                 ## overwrite only this ticker's list
+    with open(WATCHLIST_FILE, "w") as f:     ## open file in write mode (creates if missing)
+        json.dump(data, f, indent=2)         ## json.dump converts dict to JSON text, indent=2 = human readable
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Contract Tracker · Catalyst Intelligence", page_icon="🔍", layout="wide", initial_sidebar_state="expanded")
@@ -37,6 +84,7 @@ def get_watchlist_contracts(ticker):
         """, [ticker]
     )
 
+@st.cache_data(ttl=60)  ## cache 60s — bronze_options_raw only changes when pipeline runs
 def get_contract_history(symbol, metric_col="lastPrice"):
     ## Jun 25 2026: metric-aware snapshot filtering
     ##
@@ -78,7 +126,9 @@ def get_contract_history(symbol, metric_col="lastPrice"):
 
     return query(
         f"""
-        SELECT snapshot_time, lastPrice, impliedVolatility, delta, volume, openInterest
+        SELECT snapshot_time, lastPrice, impliedVolatility, delta, theta, gamma, volume, openInterest
+        -- Jul 2026: added theta (daily decay) and gamma (delta sensitivity) to SELECT
+        -- theta and gamma are stored in bronze layer from yfinance options chain
         FROM bronze_options_raw b
         WHERE contractSymbol = ?
 
@@ -96,6 +146,65 @@ def get_contract_history(symbol, metric_col="lastPrice"):
         """, [symbol]
     )
 
+@st.cache_data(ttl=60)  ## cache 60s — lifetime high/low doesn't change mid-session
+def get_contract_highlow(symbol: str) -> dict:
+    ## fetch the lifetime high and low lastPrice for this contract
+    ## used to draw horizontal reference lines on the Price + IV line chart
+    ## lastPrice > 0 excludes stale zero prints from pre/post market
+    ## HOUR filter excludes overnight garbage values
+    df = query("""
+        SELECT
+            MAX(lastPrice) AS contract_high,  -- highest price ever recorded for this contract
+            MIN(lastPrice) AS contract_low     -- lowest price ever recorded for this contract
+        FROM bronze_options_raw
+        WHERE contractSymbol = ?
+        AND lastPrice > 0
+        AND HOUR(snapshot_time) BETWEEN 9 AND 18
+    """, [symbol])
+    if df.empty:                              ## no data yet — return None so chart skips the lines
+        return {"contract_high": None, "contract_low": None}
+    return df.iloc[0].to_dict()              ## return as dict e.g. {"contract_high": 8.20, "contract_low": 0.50}
+
+def get_today_ohlc(symbol: str) -> dict:
+    ## reuse get_ohlc_data() which already builds open/high/low/close from AM+PM snapshots
+    ## grab the most recent row = latest trading day with both AM and PM snapshots
+    ohlc = get_ohlc_data(symbol)
+    if ohlc.empty:                    ## no OHLC data yet — need at least one AM+PM pair
+        return None
+    row = ohlc.iloc[-1]               ## .iloc[-1] = last row = most recent trading day
+    result = {
+        "date":  str(row["date"]),    ## trading date e.g. "2026-07-13"
+        "open":  row["open"],         ## AM snapshot price (9:35)
+        "high":  row["high"],         ## higher of open/close — synthetic high (only 2 snapshots/day)
+        "low":   row["low"],          ## lower of open/close — synthetic low
+        "close": row["close"],        ## PM snapshot price (4:15)
+    }
+    ## merge manual override — user-entered values from script win over synthesised values
+    ## only overwrites H/L — open and close come from actual snapshots, no correction needed
+    override = load_ohlc_override(symbol, result["date"])
+    if override.get("high") is not None:  ## only replace if an override exists for this date
+        result["high"] = override["high"]
+    if override.get("low") is not None:
+        result["low"] = override["low"]
+    return result
+
+@st.cache_data(ttl=60)  ## cache 60s — Greeks only update when new snapshot arrives
+def get_current_greeks(symbol):
+    ## Jul 2026: fetch latest snapshot values for Δ Delta, Θ Theta, Γ Gamma metric cards
+    ## These are shown as always-visible numbers below the watchlist — no chart needed
+    ## ORDER BY snapshot_time DESC = most recent row first
+    ## LIMIT 1 = we only want the single latest snapshot (current Greek values)
+    ## HOUR BETWEEN 9 AND 18 = exclude overnight/pre-market rows where Greeks are stale
+    return query("""
+        SELECT delta, theta, gamma
+        FROM bronze_options_raw
+        WHERE contractSymbol = ?
+        AND HOUR(snapshot_time) BETWEEN 9 AND 18
+        ORDER BY snapshot_time DESC
+        LIMIT 1
+    """, [symbol])
+
+@st.cache_data(ttl=60)  ## cache 60s — OHLC built from bronze snapshots, only changes when pipeline runs
 def get_ohlc_data(symbol):
     """Build synthetic OHLC from open(9:35)+close(16:15) snapshots."""
     df = query(
@@ -307,8 +416,8 @@ def render_candlestick(symbol, timeframe_days=None):
     st.caption(f"{symbol} · Open = 9:35 AM · Close = 4:15 PM · {len(ohlc)} trading days · OI bars match candle direction")
 
 # ── Session state ─────────────────────────────────────────────────────────────
-if "watchlist" not in st.session_state:
-    st.session_state["watchlist"] = []
+if "watchlist" not in st.session_state:          ## only runs on first page load, not every rerun
+    st.session_state["watchlist"] = load_watchlist(ticker)  ## reads from JSON instead of starting empty
 if "watchlist_ticker" not in st.session_state:
     st.session_state["watchlist_ticker"] = ticker
 
@@ -351,18 +460,94 @@ if add_clicked:
     row = filtered[filtered["strike"] == sel_strike_val]
     if not row.empty:
         symbol = row.iloc[0]["contractSymbol"]
-        if symbol not in st.session_state["watchlist"]:
-            st.session_state["watchlist"].append(symbol)
+        if symbol not in st.session_state["watchlist"]:           ## prevent duplicates
+            st.session_state["watchlist"].append(symbol)           ## add to in-memory list
+            save_watchlist(ticker, st.session_state["watchlist"])  ## immediately write to JSON on disk
 
 # ── Watchlist pills ───────────────────────────────────────────────────────────
+if st.session_state["watchlist"]:            ## only render if at least one contract is pinned
+    with st.container(border=True):          ## bordered card visually separates watchlist from controls below
+        cols = st.columns(4)                 ## fixed 4 columns — buttons stay readable regardless of count
+        for i, symbol in enumerate(st.session_state["watchlist"]):  ## loop through pinned contracts
+            if cols[i % 4].button(           ## i % 4 cycles 0,1,2,3,0,1,2,3 — wraps to new row after 4
+                f"✕ {symbol}",              ## button label shows contract symbol with X to remove
+                key=f"remove_{symbol}"      ## unique key required by Streamlit when buttons are in a loop
+            ):
+                st.session_state["watchlist"].remove(symbol)           ## remove from in-memory list
+                save_watchlist(ticker, st.session_state["watchlist"])  ## write updated list to JSON
+                st.rerun()                                             ## refresh page to reflect removal
+
+# ── Current Greeks metric cards ───────────────────────────────────────────────
+## Jul 2026: always-visible Greek snapshot for the first pinned contract
+## Shows Δ Delta, Θ Theta, Γ Gamma as number cards so user doesn't have to switch chart modes
+## Only renders when at least one contract is pinned (watchlist not empty)
 if st.session_state["watchlist"]:
-    st.markdown("**Watchlist:**")
-    cols = st.columns(len(st.session_state["watchlist"]))
-    for i, symbol in enumerate(st.session_state["watchlist"]):
-        with cols[i]:
-            if st.button(f"✕ {symbol}", key=f"remove_{symbol}"):
-                st.session_state["watchlist"].remove(symbol)
-                st.rerun()
+    greeks_df = get_current_greeks(st.session_state["watchlist"][0])  ## fetch latest Greeks for first contract
+    if not greeks_df.empty:                                            ## guard: no data yet = skip cards
+        g = greeks_df.iloc[0]                                          ## .iloc[0] = grab the single row as a Series
+
+        mc1, mc2, mc3 = st.columns(3)                                 ## three equal-width columns, one card each
+
+        with mc1:
+            ## Delta: how many dollars the option moves per $1 stock move
+            ## Puts = negative (option gains when stock falls), Calls = positive
+            ## .4f = show 4 decimal places (delta is small, e.g. -0.1042)
+            ## pandas.notna() safely checks for NaN/None without raising TypeError on pandas.NA
+            val = f"{g['delta']:.4f}" if pandas.notna(g['delta']) else "—"  ## "—" when no data
+            st.metric("Δ Delta", val, help="$change in option price per $1 move in stock")
+
+        with mc2:
+            ## Theta: daily time decay in dollars — always negative for long options
+            ## e.g. -0.08 means this option loses $0.08 per calendar day just from time passing
+            ## Theta accelerates (gets more negative) in the final 30 days before expiry
+            val = f"{g['theta']:.4f}" if pandas.notna(g['theta']) else "—"  ## "—" when no data
+            st.metric("Θ Theta", val, help="Daily time decay. Negative = losing this much per day. Accelerates near expiry.")
+
+        with mc3:
+            ## Gamma: rate of change of delta per $1 stock move
+            ## High gamma (near ATM, near expiry) = delta changes fast = option is explosive/risky
+            ## Low gamma (deep OTM or far expiry) = delta barely moves = option is stable
+            val = f"{g['gamma']:.4f}" if pandas.notna(g['gamma']) else "—"  ## "—" when no data
+            st.metric("Γ Gamma", val, help="How fast delta changes per $1 stock move. Peaks ATM near expiry.")
+
+    st.divider()                                                       ## visual separator before chart controls
+
+# ── Today's OHLC metric cards ─────────────────────────────────────────────────
+## Jul 2026: shows Open/High/Low/Close for the first pinned contract
+## OHLC is synthesised from two snapshots: AM (≈9:35) = open, PM (≈4:15) = close
+## High and Low are the max/min lastPrice seen across ALL snapshots that day
+## Only renders when the watchlist has at least one contract
+if st.session_state["watchlist"]:
+    ohlc_today = get_today_ohlc(st.session_state["watchlist"][0])  ## pull OHLC for first pinned contract
+    if ohlc_today:                                                  ## guard: None when no data for today
+        st.caption(                                                 ## small note explaining data source
+            f"📅 {ohlc_today['date']} · Open = 9:35 AM snapshot · Close = 4:15 PM snapshot"
+        )
+        c1, c2, c3, c4 = st.columns(4)                            ## four equal columns, one card per OHLC field
+
+        c1.metric("Open",  f"${ohlc_today['open']:.2f}")          ## morning price — no delta (nothing to compare to)
+
+        c2.metric(                                                  ## High card: delta = how far above open
+            "High",
+            f"${ohlc_today['high']:.2f}",
+            delta=f"+${ohlc_today['high'] - ohlc_today['open']:.2f} from open",  ## positive $ move from open
+            delta_color="normal"                                    ## green = higher than open is good
+        )
+
+        c3.metric(                                                  ## Low card: delta = how far below open
+            "Low",
+            f"${ohlc_today['low']:.2f}",
+            delta=f"-${ohlc_today['open'] - ohlc_today['low']:.2f} from open",   ## negative $ move from open
+            delta_color="inverse"                                   ## inverse: red means lower than open (expected for Low)
+        )
+
+        close_delta = ohlc_today['close'] - ohlc_today['open']     ## end-of-day P&L vs morning price
+        c4.metric(                                                  ## Close card: shows net day move
+            "Close",
+            f"${ohlc_today['close']:.2f}",
+            delta=f"{close_delta:+.2f} vs open",                   ## +/- format shows direction clearly
+            delta_color="normal"                                    ## green = closed above open (profitable long)
+        )
 
 # ── Chart type + metric + timeframe ───────────────────────────────────────────
 ctrl_a, ctrl_b, ctrl_c = st.columns([2, 2, 2])
@@ -375,7 +560,12 @@ with ctrl_b:
     ## Price + IV always shown together on dual-axis chart (Price left, IV right)
     ## Delta kept as a separate toggle since it doesn't pair naturally with price
     if chart_type == "Line":
-        show_delta = st.radio("Overlay", ["Price + IV", "Delta"], horizontal=True, key="tracker_metric")
+        ## Jul 2026: expanded from ["Price + IV", "Delta"] to include Theta and Gamma
+        ## Price + IV = dual-axis (price left, IV right) — most useful for understanding option value
+        ## Delta = directional exposure over time — shows how ATM/OTM the contract was each day
+        ## Theta = time decay over time — shows how fast the option was bleeding each day
+        ## Gamma = delta sensitivity over time — shows when the option was most explosive
+        overlay = st.radio("Overlay", ["Price + IV", "Delta", "Theta", "Gamma"], horizontal=True, key="tracker_metric")
 
 with ctrl_c:
     # Timeframe selector — shared across both line and candlestick chart types
@@ -413,33 +603,57 @@ else:
     for i, symbol in enumerate(st.session_state["watchlist"]):
         color = colors[i % len(colors)]  ## cycle through colors for each contract
 
-        if show_delta == "Delta":
-            ## Jun 25 2026: Delta mode — single metric, one point per day (latest snapshot)
-            ## Delta doesn't pair naturally with price so it gets its own single-axis chart
-            df = get_contract_history(symbol, metric_col="delta")
-            if df.empty:
-                continue
-            df = df.dropna(subset=["delta"])
+        if overlay in ("Delta", "Theta", "Gamma"):
+            ## Jul 2026: unified Greek chart — Delta, Theta, Gamma all use the same single-axis pattern
+            ## Only the DB column name, y-axis label, and line color differ between them
+            ## This avoids duplicating nearly identical code three times
 
-            ## Apply timeframe filter — slice from most recent snapshot backwards
+            ## Map overlay label → DB column name → line color
+            ## col_map: which column in bronze_options_raw to pull for this Greek
+            col_map   = {"Delta": "delta",   "Theta": "theta",   "Gamma": "gamma"}
+            ## color_map: fixed color per Greek so user can identify them by color even across contracts
+            ## Blue = Delta (directional), Red = Theta (decay/negative connotation), Green = Gamma (explosive)
+            color_map = {"Delta": "#388bfd", "Theta": "#f85149", "Gamma": "#2ea043"}
+
+            col        = col_map[overlay]    ## e.g. "delta" — the actual column name to query and plot
+            line_color = color_map[overlay]  ## e.g. "#388bfd" — fixed color for this Greek
+
+            ## get_contract_history with metric_col=col triggers the daily dedup filter
+            ## (one point per day, latest snapshot) — same logic as IV and Delta before
+            df = get_contract_history(symbol, metric_col=col)
+            if df.empty:   ## no data for this contract yet — skip silently
+                continue
+            df = df.dropna(subset=[col])  ## drop rows where this Greek is NULL (yfinance sometimes omits them)
+
+            ## Timeframe filter: slice from most recent snapshot backwards by timeframe_days
             if timeframe_days is not None:
                 cutoff = pandas.to_datetime(df["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
-                df = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]
+                df     = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]  ## keep only rows after cutoff
 
-            ## Single delta trace on left y-axis
+            ## Single-axis line chart — all Greeks live on the left y-axis
+            ## mode="lines+markers" = connected line with a dot at each daily data point
             fig.add_trace(go.Scatter(
-                x=df["snapshot_time"], y=df["delta"],
-                name=f"{symbol} Delta", mode="lines+markers",
-                line=dict(color=color, width=2), marker=dict(size=5),
-                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>Delta: %{{y:.4f}}<extra></extra>",
+                x=df["snapshot_time"],     ## x = snapshot timestamp (one per day after dedup)
+                y=df[col],                 ## y = Greek value (e.g. delta=-0.15, theta=-0.08, gamma=0.02)
+                name=f"{symbol} {overlay}",## legend label e.g. "AAPL260717P00280000 Theta"
+                mode="lines+markers",      ## line connects daily points; dots mark each snapshot
+                line=dict(color=line_color, width=2),   ## fixed Greek color, 2px wide
+                marker=dict(size=5),       ## small dots — visible but not dominating the line
+                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>{overlay}: %{{y:.4f}}<extra></extra>",
+                ## hovertemplate: on hover shows contract symbol, date+time, Greek name and value
+                ## %{{...}} = Plotly format string (double braces escape the f-string outer braces)
+                ## :.4f = 4 decimal places (Greeks are small numbers like -0.0842)
             ))
 
-            ## x-axis range caps
-            x_start = pandas.to_datetime(df["snapshot_time"]).min()
-            x_end   = pandas.to_datetime(df["snapshot_time"]).max() + pandas.Timedelta(days=30)
+            ## x-axis bounds: start at earliest data, end 30 days past last snapshot
+            x_start = pandas.to_datetime(df["snapshot_time"]).min()                               ## left edge of chart
+            x_end   = pandas.to_datetime(df["snapshot_time"]).max() + pandas.Timedelta(days=30)   ## right padding
 
             fig.update_layout(
-                yaxis=dict(title="Delta", gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d"),
+                ## y-axis label matches selected Greek name so axis is self-describing
+                ## zeroline=True draws a horizontal line at y=0 — important for Theta (always negative)
+                ## and Delta (crosses 0 when option flips ITM/OTM)
+                yaxis=dict(title=overlay, gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d"),
             )
 
         else:
@@ -492,6 +706,57 @@ else:
                 hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>IV: %{{y:.1f}}%<extra></extra>",
             ))
 
+            ## ── Contract high/low reference lines ────────────────────────────
+            ## fetch lifetime high and low for this contract
+            hl = get_contract_highlow(symbol)
+
+            if hl["contract_high"] is not None:
+                ## green dotted line at lifetime high — shows peak price this contract reached
+                fig.add_hline(
+                    y=hl["contract_high"],                                   ## y position = lifetime high price
+                    line_dash="dot",                                         ## dotted so it doesn't overpower price line
+                    line_color="#2ea043",                                    ## green = high
+                    line_width=1,                                            ## thin line — reference only
+                    annotation_text=f"High ${hl['contract_high']:.2f}",     ## label showing exact value
+                    annotation_position="right",                             ## label on the right edge
+                    annotation_font_color="#2ea043",                         ## green label matches line color
+                )
+
+            if hl["contract_low"] is not None:
+                ## red dotted line at lifetime low — shows floor the contract hit
+                fig.add_hline(
+                    y=hl["contract_low"],                                    ## y position = lifetime low price
+                    line_dash="dot",                                         ## dotted
+                    line_color="#f85149",                                    ## red = low
+                    line_width=1,                                            ## thin line
+                    annotation_text=f"Low ${hl['contract_low']:.2f}",       ## label showing exact value
+                    annotation_position="right",                             ## label on the right edge
+                    annotation_font_color="#f85149",                         ## red label matches line color
+                )
+
+            ## ── Today's OHLC reference lines ──────────────────────────────────────
+            ## Jul 2026: add today's Open/High/Low/Close as horizontal dashed lines
+            ## dash="dash" visually distinguishes these from contract high/low (dash="dot")
+            ## Loop avoids repeating nearly-identical add_hline calls for each level
+            ohlc = get_today_ohlc(symbol)   ## fetch today's synthesised OHLC for this contract
+            if ohlc:                         ## guard: None if no data yet today
+                for level_val, line_color, annotation_label in [
+                    ## tuple: (price level, line color, annotation text)
+                    (ohlc["open"],  "#8b949e", f"Today O ${ohlc['open']:.2f}"),   ## gray  = open (neutral)
+                    (ohlc["high"],  "#2ea043", f"Today H ${ohlc['high']:.2f}"),   ## green = high
+                    (ohlc["low"],   "#f85149", f"Today L ${ohlc['low']:.2f}"),    ## red   = low
+                    (ohlc["close"], "#f0c040", f"Today C ${ohlc['close']:.2f}"),  ## yellow= close (matches IV theme)
+                ]:
+                    fig.add_hline(
+                        y=level_val,                          ## horizontal line at this price
+                        line_dash="dash",                     ## long dashes — distinct from contract H/L dots
+                        line_color=line_color,                ## color from tuple above
+                        line_width=1,                         ## thin — reference only, not a data trace
+                        annotation_text=annotation_label,     ## e.g. "Today O $2.45" — label on right edge
+                        annotation_position="right",          ## right edge so it doesn't obscure the price line
+                        annotation_font_color=line_color,     ## label color matches line color
+                    )
+
             ## x-axis range — cap 30 days past last data point
             x_start = pandas.to_datetime(df_price["snapshot_time"]).min()
             x_end   = pandas.to_datetime(df_price["snapshot_time"]).max() + pandas.Timedelta(days=30)
@@ -527,7 +792,8 @@ else:
             borderwidth=1, xanchor="left", yanchor="top")
 
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"Data from Bronze layer · {len(st.session_state['watchlist'])} contract(s) tracked")
+    ## caption shows which overlay is active + how many contracts are on the chart
+    st.caption(f"Data from Bronze layer · {len(st.session_state['watchlist'])} contract(s) tracked · Overlay: {overlay if chart_type == 'Line' else 'Candlestick'}")
 
 ## OI & Volume charts — always shown below main chart regardless of metric/chart type selected
 ## Jun 18 2026: added to track positioning signals around catalyst events

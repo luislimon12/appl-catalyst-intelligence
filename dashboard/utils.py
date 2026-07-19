@@ -178,7 +178,8 @@ def render_sidebar(page_title: str):
                 ## reject the write-mode open and exit with code 1.
                 ## st.cache_resource.clear() destroys the cached connection object,
                 ## so the file is free when the subprocess opens it.
-                st.cache_resource.clear()
+                st.cache_resource.clear()  ## releases DuckDB connection so pipeline can open in write mode
+                st.cache_data.clear()      ## flushes all @st.cache_data results so next render fetches fresh data
 
                 ## Launch the script using the same Python that's running Streamlit right now.
                 ## cwd=project_root — build_database.py uses relative path "appl_catalyst.duckdb"

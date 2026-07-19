@@ -162,6 +162,7 @@ class MarketSnapshotCollector:
             self.logger.warning("No options data collected.")
             return None
 
+        options_list = [df for df in options_list if not df.empty]  ## drop empty/all-NA frames before concat — suppresses FutureWarning
         options_df = pd.concat(options_list, ignore_index=True)
 
         keep_cols = [

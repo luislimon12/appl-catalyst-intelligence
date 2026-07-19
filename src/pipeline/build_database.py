@@ -148,9 +148,21 @@ class DatabaseBuilder:
 
             self.con.execute(f"""
                 INSERT INTO bronze_options_raw
-                SELECT *,
-                       '{file_path}' AS _source_file
-                FROM read_csv_auto('{file_path}', header=True)
+                SELECT
+                    contractSymbol, expiry, option_type, strike,
+                    bid, ask, lastPrice, volume, openInterest,
+                    impliedVolatility, delta, gamma, theta, vega,
+                    -- inTheMoney arrives as 'True'/'False' OR '1.0'/'0.0' depending on pandas version
+                    -- types={{'inTheMoney':'VARCHAR'}} forces DuckDB to read it as a string first
+                    -- CASE then normalises both formats into a proper BOOLEAN
+                    CASE
+                        WHEN LOWER(inTheMoney) IN ('true',  '1', '1.0') THEN TRUE
+                        WHEN LOWER(inTheMoney) IN ('false', '0', '0.0') THEN FALSE
+                        ELSE NULL
+                    END AS inTheMoney,
+                    snapshot_time, snapshot_str, ticker,
+                    '{file_path}' AS _source_file
+                FROM read_csv_auto('{file_path}', header=True, types={{'inTheMoney': 'VARCHAR'}})
             """)
 
         print("✅ Options ingestion complete")

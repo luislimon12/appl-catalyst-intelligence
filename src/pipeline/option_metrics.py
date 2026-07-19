@@ -112,7 +112,8 @@ def make_contract_label(symbol: str, style: str = "short") -> str:
         if style == "short":
             return f"{strike_str}{cp} {date.strftime('%m/%d/%y')}"
         elif style == "full":
-            return f"{ticker} {strike_str} {option_type}  {date.strftime('%b %d \'%y')}"
+            date_str = date.strftime("%b %d '%y")          ## pre-compute outside f-string — backslash not allowed inside f-string on Python < 3.12
+            return f"{ticker} {strike_str} {option_type}  {date_str}"
         elif style == "minimal":
             return f"{strike_str}{cp}"
         else:
