@@ -108,8 +108,8 @@ def render_term_structure(ticker, spot):
     ## HAVING SUM(volume) > 10 = skip illiquid expiries with almost no trading
     df = query("""
         SELECT expiry,
-               SUM(iv * volume) / NULLIF(SUM(volume), 0) * 100 AS atm_iv,  ## volume-weighted IV %
-               SUM(volume) AS vol                                            ## total volume this expiry
+               SUM(iv * volume) / NULLIF(SUM(volume), 0) * 100 AS atm_iv,  -- volume-weighted IV %
+               SUM(volume) AS vol                                            -- total volume this expiry
         FROM gold_latest_snapshot
         WHERE ticker = ? AND iv > 0 AND strike BETWEEN ? AND ?
         GROUP BY expiry

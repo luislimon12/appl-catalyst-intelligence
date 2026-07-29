@@ -22,8 +22,11 @@ DB_PATH = Path(__file__).parent.parent / "appl_catalyst.duckdb"
 TICKERS = ["AAPL", "INTC"]
 
 CATALYST_EVENTS = {
-    "WWDC 2026":          "2026-06-09",
-    "iPhone Launch 2026": "2026-09-09",
+    "WWDC 2026":         "2026-06-09",   ## past — still shows on Contract Tracker historical charts
+    "Q3 Earnings":       "2026-07-30",   ## confirmed — Tim Cook + Kevan Parekh call at 5PM EDT
+    "~CEO Transition":   "2026-09-01",   ## estimated — John Ternus assumes CEO, Cook → Exec Chairman
+    "~iPhone 18 Keynote":"2026-09-09",   ## estimated — iPhone 18 Pro / Pro Max / foldable unveil
+    "~iPhone Ultra":     "2026-10-28",   ## estimated — staggered release, late Oct/early Nov window
 }
 
 REFRESH_OPTIONS = {
