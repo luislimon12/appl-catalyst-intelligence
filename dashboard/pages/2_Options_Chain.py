@@ -98,127 +98,116 @@ def render_skew_chart(ticker, expiry, spot):
     st.caption(f"IV Skew · {format_expiry(expiry)} · Bubble size = volume · Blue = Calls · Red = Puts · Spot in yellow")
 
 def render_term_structure(ticker, spot):
-    ## Jun 25 2026: term structure chart — shown when ALL expiries selected
-    ## X-axis = expiry date, Y-axis = ATM IV for that expiry
-    ## ATM IV = average IV of strikes within 5% of spot (closest to current price)
-    ## Answers: "which expiry has the most event premium priced in?"
+    ## CHANGED Jul 2026: switched x-axis from calendar date → DTE (days to expiry)
+    ## REASON: calendar date clusters weekly AAPL options on the left making chart unreadable
+    ## DTE spaces expiries evenly regardless of how many weeklies exist near-term
 
-    ## Fetch volume-weighted ATM IV grouped by expiry
+    ## unchanged query — volume-weighted ATM IV grouped by expiry
     ## BETWEEN spot*0.95 and spot*1.05 = near-money strikes only (5% range)
-    ##
-    ## Fix 1 — volume-weighted IV instead of simple AVG:
-    ##   SUM(iv * volume) / SUM(volume) weights each strike by how much it traded
-    ##   High-volume ATM strikes dominate — low-volume outliers barely move the number
-    ##   NULLIF(SUM(volume), 0) prevents division by zero when no volume
-    ##
-    ## Fix 2 — HAVING SUM(volume) > 10:
-    ##   Skips expiries with almost no trading — removes noise from illiquid far-dated expiries
-    ##   Prevents flat line extending to 2028/2029 where nobody is trading
+    ## SUM(iv * volume) / NULLIF(SUM(volume), 0) = volume-weighted IV to reduce noise
+    ## HAVING SUM(volume) > 10 = skip illiquid expiries with almost no trading
     df = query("""
         SELECT expiry,
-               SUM(iv * volume) / NULLIF(SUM(volume), 0) * 100 AS atm_iv,  -- volume-weighted IV %
-               SUM(volume) AS vol                                            -- total volume this expiry
+               SUM(iv * volume) / NULLIF(SUM(volume), 0) * 100 AS atm_iv,  ## volume-weighted IV %
+               SUM(volume) AS vol                                            ## total volume this expiry
         FROM gold_latest_snapshot
         WHERE ticker = ? AND iv > 0 AND strike BETWEEN ? AND ?
         GROUP BY expiry
-        HAVING SUM(volume) > 10          -- skip expiries with almost no trading
+        HAVING SUM(volume) > 10
         ORDER BY expiry
     """, [ticker, spot * 0.95, spot * 1.05])
     if df.empty:
         return
 
-    ## Fix 3 — cap x-axis to 18 months out from earliest expiry
-    ## Prevents chart stretching to 2028/2029 — all meaningful action is within 18 months
-    x_start = pandas.to_datetime(df["expiry"]).min()
-    x_end   = x_start + pandas.DateOffset(months=18)
-    df      = df[pandas.to_datetime(df["expiry"]) <= x_end]  ## drop rows beyond 18 months
+    ## NEW: compute DTE — integer days from today to each expiry
+    df["dte"] = (pandas.to_datetime(df["expiry"]) - pandas.Timestamp.now()).dt.days
+
+    ## NEW: filter DTE < 7 — near-expiry options have artificially inflated IV
+    ## annualization math (IV × √252) blows up when DTE approaches 0 — not real signal
+    ## REMOVED: date-based x_start/x_end cap → replaced with DTE cap (7 to 540 days = ~18 months)
+    df = df[(df["dte"] >= 7) & (df["dte"] <= 540)]
 
     if df.empty:
         return
 
-    ## Scale volume to bubble size: low volume → 8px, max volume → 44px
-    ## Bigger bubble = more actively traded expiry = more trustworthy IV
+    ## unchanged — bubble sizing by volume
+    ## bigger bubble = more actively traded expiry = more trustworthy IV
     max_vol = df["vol"].max() or 1
     sizes   = (df["vol"] / max_vol * 36 + 8).clip(8, 44)
 
-    ## ── Slope / first derivative ────────────────────────────────────────────
-    ## dIV/dt = change in ATM IV between consecutive expiries divided by calendar
-    ##          days between them.  Units: IV% per calendar day.
-    ## Positive slope → IV rises as you go further out (normal contango shape).
-    ## Negative slope → IV falls further out (backwardation — event premium in near term).
-    ##
-    ## shift(1) aligns each row with the *previous* row so subtraction is pairwise.
-    ## First row has no predecessor → NaN → filled with 0 (no slope to display).
+    ## CHANGED: slope now uses DTE gap instead of calendar days between expiry dates
+    ## REMOVED: df["expiry_dt"] and df["days"] columns (date-based gap calculation)
+    ## REPLACED WITH: df["dte_gap"] — difference in DTE between consecutive expiries
+    ## Positive slope → IV rises further out (contango). Negative → backwardation.
+    df["dte_gap"]   = df["dte"] - df["dte"].shift(1)                ## DTE gap between consecutive expiries
+    df["iv_change"] = df["atm_iv"] - df["atm_iv"].shift(1)          ## IV % change between expiries
+    df["slope"]     = (df["iv_change"] / df["dte_gap"]).fillna(0)   ## rate of change per DTE day; NaN → 0 for first row
 
-    df["expiry_dt"] = pandas.to_datetime(df["expiry"])                     ## datetime column for math
-    df["days"]      = (df["expiry_dt"] - df["expiry_dt"].shift(1)).dt.days ## calendar days between consecutive expiries
-    df["iv_change"] = df["atm_iv"] - df["atm_iv"].shift(1)                 ## IV % change between expiries
-    df["slope"]     = (df["iv_change"] / df["days"]).fillna(0)             ## rate of change; NaN → 0 for first row
-
-    ## Color each slope bar: green = IV rising (contango), red = IV falling (backwardation)
+    ## unchanged — color logic: green = contango, red = backwardation
     slope_colors = ["#2ea043" if s >= 0 else "#f85149" for s in df["slope"]]
 
-    ## ── Two-row subplot layout ───────────────────────────────────────────────
-    ## Row 1 (65%): ATM IV bubbles connected by line — same as before
-    ## Row 2 (35%): slope bars — shows how fast IV is changing between expiries
-    ## shared_xaxes=True means both rows zoom/pan together (linked x-axis)
+    ## unchanged — two-row subplot layout
     fig = make_subplots(
         rows=2, cols=1,
-        shared_xaxes=True,                                                 ## zoom one row → other follows
-        row_heights=[0.65, 0.35],                                          ## top row gets 65% of height
-        vertical_spacing=0.08,                                             ## gap between rows
-        subplot_titles=["ATM IV by Expiry", "Slope (dIV/dt) — IV% per day"],
+        shared_xaxes=True,                  ## zoom one row → other follows
+        row_heights=[0.65, 0.35],           ## top row gets 65% of height
+        vertical_spacing=0.08,
+        subplot_titles=["ATM IV by DTE", "Slope (dIV/dDTE) — IV% per day"],  ## CHANGED: titles reflect DTE
     )
 
-    ## Row 1: term structure — line + bubbles sized by volume
+    ## CHANGED: x=df["dte"] instead of x=df["expiry"]
+    ## CHANGED: hover now shows both DTE and expiry date for context
     fig.add_trace(go.Scatter(
-        x=df["expiry"],
+        x=df["dte"],
         y=df["atm_iv"],
         mode="lines+markers",
         marker=dict(color="#58a6ff", size=sizes, opacity=0.85),
         line=dict(color="#58a6ff", width=2),
         name="ATM IV",
-        customdata=df["vol"],
-        hovertemplate="Expiry: %{x}<br>ATM IV: %{y:.1f}%<br>Vol: %{customdata:,.0f}<extra></extra>",
+        customdata=df[["vol", "expiry"]].values,             ## CHANGED: added expiry to customdata for hover
+        hovertemplate="DTE: %{x}d<br>Expiry: %{customdata[1]}<br>ATM IV: %{y:.1f}%<br>Vol: %{customdata[0]:,.0f}<extra></extra>",
     ), row=1, col=1)
 
-    ## Row 2: slope bars — green = positive (IV increasing), red = negative (IV decreasing)
+    ## CHANGED: x=df["dte"] instead of x=df["expiry"]
     fig.add_trace(go.Bar(
-        x=df["expiry"],
+        x=df["dte"],
         y=df["slope"],
         marker_color=slope_colors,
         name="Slope",
-        hovertemplate="Expiry: %{x}<br>dIV/dt: %{y:.3f}%/day<extra></extra>",
+        hovertemplate="DTE: %{x}d<br>dIV/dDTE: %{y:.3f}%/day<extra></extra>",
     ), row=2, col=1)
 
-    ## Zero reference line on slope panel — makes it easy to see which bars cross zero
+    ## unchanged — zero reference line on slope panel
     fig.add_hline(y=0, line_width=1, line_color="#30363d", row=2, col=1)
 
-    ## Catalyst markers — purple dotted vlines on BOTH rows (shared_xaxes propagates x)
-    for name, date in CATALYST_EVENTS.items():
-        if pandas.to_datetime(date) <= x_end:
-            ## add_vline applies to all rows when rows/cols not specified
-            fig.add_vline(x=date, line_width=1, line_dash="dot", line_color="#bc8cff")
+    ## CHANGED: catalyst markers converted from calendar date → DTE for x-axis positioning
+    ## REMOVED: pandas.to_datetime(date) <= x_end date check
+    ## REPLACED WITH: DTE range check (7 to 540)
+    for event_name, event_date in CATALYST_EVENTS.items():
+        cat_dte = (pandas.to_datetime(event_date) - pandas.Timestamp.now()).days
+        if 7 <= cat_dte <= 540:           ## only show if within our DTE window
+            fig.add_vline(x=cat_dte, line_width=1, line_dash="dot", line_color="#bc8cff")
             fig.add_annotation(
-                x=date, y=1, yref="paper", text=name, showarrow=False,
+                x=cat_dte, y=1, yref="paper", text=event_name, showarrow=False,
                 font=dict(color="#bc8cff", size=11), bgcolor="#0e1117",
                 bordercolor="#bc8cff", borderwidth=1, xanchor="left", yanchor="top",
             )
 
+    ## CHANGED: xaxis range now 0-540 DTE instead of date range
+    ## CHANGED: xaxis2 title updated to "Days to Expiry (DTE)"
+    ## REMOVED: x_start, x_end date variables
     fig.update_layout(
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0",
-        height=480,                                                        ## taller to fit two rows
+        height=480,
         margin=dict(t=40, b=40, l=60, r=20),
         showlegend=False,
-        xaxis=dict(gridcolor="#21262d", color="#8b949e",
-                   range=[x_start, x_end]),                                ## lock both x-axes to 18-month window
-        xaxis2=dict(title="Expiry", gridcolor="#21262d", color="#8b949e",
-                    range=[x_start, x_end]),                               ## bottom row x-axis label
+        xaxis=dict(gridcolor="#21262d", color="#8b949e", range=[0, 540]),
+        xaxis2=dict(title="Days to Expiry (DTE)", gridcolor="#21262d", color="#8b949e", range=[0, 540]),
         yaxis=dict(title="ATM IV %", gridcolor="#21262d", color="#8b949e"),
         yaxis2=dict(title="IV%/day", gridcolor="#21262d", color="#8b949e", zeroline=False),
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption("Term Structure · Volume-weighted ATM IV · Bubble = volume · Slope = dIV/dt · Green = contango · Red = backwardation")
+    st.caption("Term Structure · DTE x-axis · Volume-weighted ATM IV · Bubble = volume · Slope = dIV/dDTE · Green = contango · Red = backwardation")
 
 ## Jun 25 2026: DTE bucket helper
 ## Maps days-to-expiry integer to a labeled bucket matching the theta decay curve zones

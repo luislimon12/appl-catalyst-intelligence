@@ -422,7 +422,7 @@ if "watchlist_ticker" not in st.session_state:
     st.session_state["watchlist_ticker"] = ticker
 
 if st.session_state["watchlist_ticker"] != ticker:
-    st.session_state["watchlist"] = []
+    st.session_state["watchlist"] = load_watchlist(ticker)  ## load saved contracts for new ticker instead of clearing to empty
     st.session_state["watchlist_ticker"] = ticker
 
 # ── Contract selector ─────────────────────────────────────────────────────────
