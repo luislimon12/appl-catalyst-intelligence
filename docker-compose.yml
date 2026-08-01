@@ -1,0 +1,57 @@
+## docker-compose.yml
+## Defines and connects two containers: streamlit + nginx
+## Run with: docker compose up -d
+
+services:
+
+  ## ── Streamlit container ───────────────────────────────────────────────────
+  streamlit:
+    build: .                       ## build image from the Dockerfile in this directory
+    container_name: catalyst_dashboard
+    restart: unless-stopped        ## auto-restart if container crashes or droplet reboots
+                                   ## "unless-stopped" means it won't restart if you manually stop it
+    volumes:
+      ## Mount the duckdb file from the host into the container at /app/appl_catalyst.duckdb
+      ## :ro = read-only — dashboard can read but never write to the DB file
+      ## The file stays on the host (droplet) so you can scp a new one without rebuilding
+      - ./appl_catalyst.duckdb:/app/appl_catalyst.duckdb:ro
+
+      ## Mount watchlist.json — dashboard reads and writes to this file
+      ## No :ro so the container can save pinned contracts across sessions
+      - ./watchlist.json:/app/watchlist.json
+
+    expose:
+      - "8501"                     ## internal port — only reachable by other containers
+                                   ## NOT published to the host, never exposed to internet
+    networks:
+      - internal                   ## both containers share this private network
+
+  ## ── Nginx container ───────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine            ## pre-built Nginx image — no Dockerfile needed
+                                   ## alpine = minimal Linux, ~20MB image
+    container_name: catalyst_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"                    ## HTTP — only used to redirect visitors to HTTPS
+      - "443:443"                  ## HTTPS — the actual dashboard, SSL terminates here
+    volumes:
+      ## Mount our nginx.conf into the container's config directory
+      ## :ro = Nginx only reads config, never writes it
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      ## Mount Let's Encrypt cert folder from the host into the Nginx container
+      ## Certbot writes certs here on the droplet after we run it
+      ## :ro = Nginx only reads certs, never writes them
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - streamlit                  ## don't start Nginx until Streamlit container is up
+    networks:
+      - internal
+
+## ── Private network ───────────────────────────────────────────────────────────
+## Both containers join this network — they can reach each other by container name
+## e.g. Nginx proxies to http://streamlit:8501 using the container name as hostname
+## Nothing outside this network can reach streamlit:8501 directly
+networks:
+  internal:
+    driver: bridge                 ## bridge = standard isolated Docker network

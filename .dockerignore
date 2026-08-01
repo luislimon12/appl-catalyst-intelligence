@@ -1,0 +1,42 @@
+## .dockerignore — tells Docker what to exclude when building the image
+## Works exactly like .gitignore but for docker build
+## Without this, Docker copies everything into the image including the database,
+## git history, logs, and notebooks — bloating the image unnecessarily
+
+## Database — never bake this into the image
+## It's mounted as a volume at runtime so it stays on the host
+## Including it would add ~50MB to every image build unnecessarily
+*.duckdb
+
+## Git history — the image doesn't need version control history
+## Excluding this shaves significant size off the image
+.git
+.gitignore
+
+## Python cache — compiled bytecode auto-regenerates when the app runs
+## No point shipping it in the image
+__pycache__
+*.pyc
+*.pyo
+
+## Environment files — these often contain secrets like API keys
+## Never let these get into a Docker image
+.env
+.env.*
+
+## Local development files — not needed on the server
+logs/
+data/
+notebooks/
+tests/
+docs/
+api/
+monitoring/
+scripts/
+
+## Mac junk files
+.DS_Store
+
+## The Docker files themselves don't need to be inside the image
+docker-compose.yml
+.dockerignore
