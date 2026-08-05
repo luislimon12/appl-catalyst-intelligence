@@ -8,6 +8,7 @@
 #                        after collection. LaunchAgent updated to fire at 9:35 + 16:15.
 # ──────────────────────────────────────────────────────────────────────────────
 import os
+import sys
 import subprocess
 import logging
 from datetime import datetime, date
@@ -209,7 +210,7 @@ if __name__ == "__main__":
 
     ## Run database pipeline after all tickers collected
     pipeline_dir = os.path.dirname(os.path.abspath(__file__))
-    python       = "/opt/anaconda3/bin/python3"
+    python       = sys.executable  ## always use the same Python that's running this script
 
     logging.info("Running build_database.py...")
     subprocess.run([python, os.path.join(pipeline_dir, "build_database.py")], check=True)
