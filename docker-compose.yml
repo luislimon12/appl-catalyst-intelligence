@@ -12,9 +12,9 @@ services:
                                    ## "unless-stopped" means it won't restart if you manually stop it
     volumes:
       ## Mount the duckdb file from the host into the container at /app/appl_catalyst.duckdb
-      ## :ro = read-only — dashboard can read but never write to the DB file
+     
       ## The file stays on the host (droplet) so you can scp a new one without rebuilding
-      - ./appl_catalyst.duckdb:/app/appl_catalyst.duckdb:ro
+      - ./appl_catalyst.duckdb:/app/appl_catalyst.duckdb
 
       ## Mount watchlist.json — dashboard reads and writes to this file
       ## No :ro so the container can save pinned contracts across sessions
