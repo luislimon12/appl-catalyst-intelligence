@@ -247,6 +247,7 @@ def get_chain_data(ticker, expiry, option_type, spot, pct_range):
     ## Used by the DTE bucket filter and displayed as a column in the chain table
     today = pandas.Timestamp(date_type.today())
     df["dte"] = (pandas.to_datetime(df["expiry"]) - today).dt.days
+    df = df[df["dte"] >= 0]  ## drop expired contracts — negative DTE = already expired
 
     ## Jun 25 2026: compute Vol/OI and OI/Vol using vectorized pandas — avoids NA errors
     ## lambda + round() fails when either column contains pandas.NA (NAType has no __round__)
