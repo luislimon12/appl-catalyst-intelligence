@@ -447,19 +447,27 @@ try:
         ROUND(SUM(delta * openInterest), 4)                                                  AS net_delta,
 
         -- raw gamma: sum of (gamma * OI) per side and net
-        ROUND(SUM(CASE WHEN option_type = 'call' THEN gamma * openInterest ELSE 0 END), 4)  AS call_gamma,
-        ROUND(SUM(CASE WHEN option_type = 'put'  THEN gamma * openInterest ELSE 0 END), 4)  AS put_gamma,
-        ROUND(SUM(gamma * openInterest), 4)                                                  AS net_gamma,
+        -- puts are positive raw gamma but negative dealer GEX (dealers are short gamma on puts)
+        ROUND(SUM(CASE WHEN option_type = 'call' THEN  gamma * openInterest ELSE 0 END), 4)  AS call_gamma,
+        ROUND(SUM(CASE WHEN option_type = 'put'  THEN  gamma * openInterest ELSE 0 END), 4)  AS put_gamma,
+        ROUND(SUM(CASE WHEN option_type = 'call' THEN  gamma * openInterest              -- calls: dealers long gamma → positive
+                       WHEN option_type = 'put'  THEN -gamma * openInterest              -- puts: dealers short gamma → flip to negative
+                  END), 4)                                                                AS net_gamma,
 
         -- notional delta: scaled to dollars (OI * strike * 100 shares per contract)
         ROUND(SUM(CASE WHEN option_type = 'call' THEN delta * openInterest * strike * 100 ELSE 0 END), 2)  AS call_delta_notional,
         ROUND(SUM(CASE WHEN option_type = 'put'  THEN delta * openInterest * strike * 100 ELSE 0 END), 2)  AS put_delta_notional,
         ROUND(SUM(delta * openInterest * strike * 100), 2)                                                  AS net_delta_notional,
 
-        -- notional gamma: scaled to dollars
-        ROUND(SUM(CASE WHEN option_type = 'call' THEN gamma * openInterest * strike * 100 ELSE 0 END), 2)  AS call_gamma_notional,
-        ROUND(SUM(CASE WHEN option_type = 'put'  THEN gamma * openInterest * strike * 100 ELSE 0 END), 2)  AS put_gamma_notional,
-        ROUND(SUM(gamma * openInterest * strike * 100), 2)                                                  AS net_gamma_notional,
+        -- notional gamma (dollar gamma per 1% move): gamma * OI * strike^2 * 0.01 * 100 shares
+        -- strike^2 * 0.01 * 100 = strike^2 because 0.01 * 100 = 1
+        -- this gives: dollar delta change if underlying moves 1% (strike * 0.01 dollars)
+        -- put GEX is flipped negative — dealers are net short gamma on puts
+        ROUND(SUM(CASE WHEN option_type = 'call' THEN  gamma * openInterest * strike * strike * 0.01 * 100 ELSE 0 END), 2)  AS call_gamma_notional,
+        ROUND(SUM(CASE WHEN option_type = 'put'  THEN  gamma * openInterest * strike * strike * 0.01 * 100 ELSE 0 END), 2)  AS put_gamma_notional,
+        ROUND(SUM(CASE WHEN option_type = 'call' THEN  gamma * openInterest * strike * strike * 0.01 * 100   -- calls add positive GEX
+                       WHEN option_type = 'put'  THEN -gamma * openInterest * strike * strike * 0.01 * 100   -- puts subtract (flip sign)
+                  END), 2)                                                                                    AS net_gamma_notional,
 
         MAX(snapshot_time)  AS snapshot_time,
         MAX(snapshot_str)   AS snapshot_str
