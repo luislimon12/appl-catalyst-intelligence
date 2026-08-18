@@ -208,22 +208,18 @@ def render_gex(ticker: str):
     selected_label  = st.selectbox("Expiry", expiry_labels, index=0, key="gex_expiry")
     selected_expiry = expiry_options[expiry_labels.index(selected_label)]
 
-    ## Jun 21 2026: fetch call, put, and net GEX separately so we can show split bars
+    ## single-bar chart only needs net GEX per strike
     if selected_expiry == "ALL":
         df = query("""
             SELECT strike,
-                   SUM(call_gamma_notional) AS call_gex,  -- dealer gamma from calls at this strike
-                   SUM(put_gamma_notional)  AS put_gex,   -- dealer gamma from puts at this strike
-                   SUM(net_gamma_notional)  AS net_gex    -- net = call + put combined
+                   SUM(net_gamma_notional) AS net_gex  -- aggregate net GEX across all expiries
             FROM gold_greeks_exposure WHERE ticker = ?
             GROUP BY strike ORDER BY strike
         """, [ticker])
     else:
         df = query("""
             SELECT strike,
-                   call_gamma_notional AS call_gex,  -- dealer gamma from calls at this strike
-                   put_gamma_notional  AS put_gex,   -- dealer gamma from puts at this strike
-                   net_gamma_notional  AS net_gex    -- net = call + put combined
+                   net_gamma_notional AS net_gex        -- net GEX for this expiry only
             FROM gold_greeks_exposure WHERE ticker = ? AND expiry = ?
             ORDER BY strike
         """, [ticker, selected_expiry])
@@ -233,68 +229,75 @@ def render_gex(ticker: str):
         return
 
     df = df.copy()
-    lower, upper = spot * 0.80, spot * 1.20                ## limit to ±20% of spot
-    df = df[(df["strike"] >= lower) & (df["strike"] <= upper)]  ## filter strikes
+    df = df[(df["strike"] >= spot * 0.80) & (df["strike"] <= spot * 1.20)]  ## ±20% of spot
 
-    ## Scale from dollars to $K so y-axis numbers are readable (22000 → 22.0)
-    df["call_gex_k"] = df["call_gex"] / 1000   ## call GEX in thousands
-    df["put_gex_k"]  = df["put_gex"]  / 1000   ## put GEX in thousands
-    df["net_gex_k"]  = df["net_gex"]  / 1000   ## net GEX in thousands
+    ## Step 5 — scale to $M
+    df["net_gex_m"] = df["net_gex"] / 1_000_000
 
+    ## Step 6 — color by sign
+    df["color"] = df["net_gex_m"].apply(lambda v: "#2ea043" if v >= 0 else "#f85149")
+
+    ## Step 7 — gamma flip: find where sign changes between adjacent strikes
+    s = df.sort_values("strike")
+    flip_strike = None
+    for i in range(len(s) - 1):
+        a, b = s.iloc[i]["net_gex_m"], s.iloc[i + 1]["net_gex_m"]
+        if a * b < 0:                                           ## opposite signs → crossed zero
+            flip_strike = s.iloc[i]["strike"] if abs(a) < abs(b) else s.iloc[i + 1]["strike"]
+            break
+
+    ## Step 8 — call wall: highest positive bar
+    pos = df[df["net_gex_m"] > 0]
+    cw  = pos.nlargest(1, "net_gex_m").iloc[0] if not pos.empty else None
+
+    ## Step 9 — put wall: deepest negative bar
+    neg = df[df["net_gex_m"] < 0]
+    pw  = neg.nsmallest(1, "net_gex_m").iloc[0] if not neg.empty else None
+
+    ## Step 10 — draw chart
     fig = go.Figure()
 
-    ## Blue bars = call GEX — dealer gamma from call contracts at each strike
-    ## Positive = dealers are long gamma here (stabilizing — they sell into rallies)
+    ## bars — one per strike, green or red
     fig.add_trace(go.Bar(
-        x=df["strike"],           ## x-axis = strike price
-        y=df["call_gex_k"],       ## height = call GEX in $K
-        name="Call GEX",          ## legend label
-        marker_color="#388bfd",   ## blue — calls
-        opacity=0.8,              ## slight transparency so bars don't overpower
-        hovertemplate="Strike: $%{x}<br>Call GEX: $%{y:.1f}K<extra></extra>",
+        x=df["strike"], y=df["net_gex_m"],
+        marker_color=df["color"].tolist(),
+        hovertemplate="Strike: $%{x}<br>Net GEX: $%{y:.2f}M<extra></extra>",
     ))
 
-    ## Orange bars = put GEX — dealer gamma from put contracts at each strike
-    ## Negative = dealers are short gamma here (destabilizing — they sell into drops)
-    fig.add_trace(go.Bar(
-        x=df["strike"],           ## x-axis = strike price
-        y=df["put_gex_k"],        ## height = put GEX in $K (typically negative)
-        name="Put GEX",           ## legend label
-        marker_color="#f0a500",   ## orange — puts
-        opacity=0.8,              ## slight transparency
-        hovertemplate="Strike: $%{x}<br>Put GEX: $%{y:.1f}K<extra></extra>",
-    ))
-
-    ## White dotted line = net GEX — where call and put gamma cancel out
-    ## Zero crossing = gamma flip point — price tends to accelerate past this level
-    fig.add_trace(go.Scatter(
-        x=df["strike"],                                     ## x-axis = strike price
-        y=df["net_gex_k"],                                  ## y = net GEX in $K
-        name="Net GEX",                                     ## legend label
-        mode="lines",                                       ## line only, no dots
-        line=dict(color="#e0e0e0", width=2, dash="dot"),    ## white dotted line
-        hovertemplate="Strike: $%{x}<br>Net GEX: $%{y:.1f}K<extra></extra>",
-    ))
-
-    ## Spot price vertical line — shows current price relative to gamma walls
+    ## spot line
     fig.add_vline(x=spot, line_width=2, line_dash="dash", line_color="#f0c040")
-    fig.add_annotation(
-        x=spot, y=1, yref="paper", text=f"Spot ${spot:.2f}", showarrow=False,
-        font=dict(color="#f0c040", size=12), bgcolor="#0e1117",
-        bordercolor="#f0c040", borderwidth=1, xanchor="left", yanchor="top"
-    )
+    fig.add_annotation(x=spot, y=1, yref="paper", text=f"Spot ${spot:.2f}",
+        showarrow=False, font=dict(color="#f0c040", size=12),
+        bgcolor="#0e1117", bordercolor="#f0c040", borderwidth=1, xanchor="left", yanchor="top")
+
+    ## gamma flip line
+    if flip_strike:
+        fig.add_vline(x=flip_strike, line_width=1, line_dash="dot", line_color="#8b949e")
+        fig.add_annotation(x=flip_strike, y=0.05, yref="paper", text=f"Flip ${flip_strike:.0f}",
+            showarrow=False, font=dict(color="#8b949e", size=11),
+            bgcolor="#0e1117", bordercolor="#8b949e", borderwidth=1, xanchor="center")
+
+    ## call wall label
+    if cw is not None:
+        fig.add_annotation(x=cw["strike"], y=cw["net_gex_m"], text=f"Call Wall<br>${cw['strike']:.0f}",
+            showarrow=True, arrowhead=2, font=dict(color="#2ea043", size=11),
+            bgcolor="#0e1117", bordercolor="#2ea043", borderwidth=1, ay=-35)
+
+    ## put wall label
+    if pw is not None:
+        fig.add_annotation(x=pw["strike"], y=pw["net_gex_m"], text=f"Put Wall<br>${pw['strike']:.0f}",
+            showarrow=True, arrowhead=2, font=dict(color="#f85149", size=11),
+            bgcolor="#0e1117", bordercolor="#f85149", borderwidth=1, ay=35)
 
     fig.update_layout(
         paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0", height=400,
-        margin=dict(t=40, b=40, l=60, r=20),
-        barmode="group",   ## side-by-side bars — easier to compare call vs put GEX per strike
+        margin=dict(t=40, b=40, l=60, r=20), showlegend=False,
         xaxis=dict(title="Strike", tickprefix="$", gridcolor="#21262d", color="#8b949e"),
-        yaxis=dict(title="GEX ($K)", gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d", zerolinewidth=2),
-        legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
-        bargap=0.15,   ## small gap between strike groups
+        yaxis=dict(title="Net GEX ($M)", gridcolor="#21262d", color="#8b949e",
+                   zeroline=True, zerolinecolor="#30363d", zerolinewidth=2),
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"Spot: ${spot:.2f} · Blue = Call GEX · Orange = Put GEX · Dotted = Net · ±20% of spot")
+    st.caption(f"Spot: ${spot:.2f} · Green = Dealers Long Gamma · Red = Dealers Short Gamma · ±20% of spot")
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 gauge_col, cards_col = st.columns([1, 2])  ## left = 1/3 width (gauge), right = 2/3 width (cards)
