@@ -4,6 +4,16 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.6.0] — Session 6 · August 2026
+
+### GEX formula fix
+
+* `build_silver.py` — upgraded `net_gamma_notional`, `call_gamma_notional`, and `put_gamma_notional` from simple notional (`gamma × OI × strike × 100`) to proper dollar gamma per 1% move (`gamma × OI × strike² × 0.01 × 100`). Higher-priced strikes were previously underweighted relative to their true hedging impact.
+* `build_silver.py` — `net_gamma` and `net_gamma_notional` now flip sign for puts. Dealers are short gamma on put positions, so put GEX subtracts from net. The previous formula added calls and puts as both positive, overstating net GEX and hiding the gamma flip level.
+* Requires `docker exec catalyst_dashboard python src/pipeline/build_silver.py` on the droplet to rebuild `gold_greeks_exposure` with corrected values.
+
+---
+
 ## [0.5.0] — Session 5 · August 2026
 
 ### Production deployment
