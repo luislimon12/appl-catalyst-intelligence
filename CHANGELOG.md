@@ -4,6 +4,19 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.7.0] — Session 7 · August 2026
+
+### Pipeline — moved to droplet cron job
+
+* Diagnosed data collection gap (Aug 19–24): Mac LaunchAgent only fires when the Mac is on; droplet runs 24/7
+* Removed dependency on Mac for pipeline execution
+* Added two cron entries on the droplet running as root:
+  * `35 13 * * 1-5` — 9:35 AM EST (13:35 UTC) — market open snapshot
+  * `15 21 * * 1-5` — 4:15 PM EST (21:15 UTC) — market close snapshot
+* Both entries run `docker exec catalyst_dashboard python src/pipeline/collect_market_snapshots.py` inside the running container
+
+---
+
 ## [0.6.0] — Session 6 · August 2026
 
 ### GEX formula fix
