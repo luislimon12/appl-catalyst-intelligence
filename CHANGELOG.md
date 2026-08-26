@@ -10,6 +10,8 @@ All significant changes documented in reverse chronological order.
 
 * `3_Contract_Tracker.py` — all `HOUR(snapshot_time) BETWEEN 9 AND 18` filters extended to `BETWEEN 9 AND 23`. The pipeline previously ran on the Mac (EST timestamps), so the 4:15 PM snapshot was stored as hour 16. After moving to the droplet (UTC), it is stored as hour 21, which the old upper bound of 18 excluded. Greeks and IV were being read from the 9:35 AM snapshot only, which often shows near-zero values for deep OTM contracts.
 * `3_Contract_Tracker.py` — `get_ohlc_data` morning/afternoon split changed from `hour < 12 / >= 12` to `hour < 17 / >= 17`. The 9:35 AM EST snapshot is hour 13 UTC — the old threshold put it in the afternoon bucket alongside the 4:15 PM snapshot (hour 21 UTC), causing open to always equal close. Now morning correctly captures hour 13 and afternoon captures hour 21.
+* `3_Contract_Tracker.py` — fixed remaining `BETWEEN 9 AND 18` in the correlated dedup subquery inside `get_contract_history`, missed in the initial pass.
+* `3_Contract_Tracker.py` — removed Python `##` comment from inside a triple-quoted SQL string; DuckDB received it as literal SQL text and threw a parser error (`syntax error at or near "#"`). Comments inside SQL strings must use `--` (SQL syntax) or be placed outside the string.
 
 ---
 

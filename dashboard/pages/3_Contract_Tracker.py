@@ -120,7 +120,7 @@ def get_contract_history(symbol, metric_col="lastPrice"):
                 FROM bronze_options_raw b2
                 WHERE b2.contractSymbol = b.contractSymbol            -- same contract
                 AND DATE(b2.snapshot_time) = DATE(b.snapshot_time)    -- same calendar day
-                AND HOUR(b2.snapshot_time) BETWEEN 9 AND 18          -- market hours only
+                AND HOUR(b2.snapshot_time) BETWEEN 9 AND 23          -- market hours only (UTC: 9:35 AM EST = 13 UTC, 4:15 PM EST = 21 UTC)
             )
         """
 
@@ -135,7 +135,7 @@ def get_contract_history(symbol, metric_col="lastPrice"):
         -- Jun 17 2026: exclude overnight/pre-market snapshots
         -- Midnight runs return IV near 0% (bid=ask=0, market closed) — corrupts the chart
         -- Only keep snapshots between 9 AM and 6 PM
-        AND HOUR(snapshot_time) BETWEEN 9 AND 23  ## Aug 2026: extended from 18 to 23 UTC — 4:15 PM EST = 21:15 UTC, was being excluded by old upper bound of 18
+        AND HOUR(snapshot_time) BETWEEN 9 AND 23
 
         -- Jun 25 2026: injected dynamically based on metric_col
         -- Empty string for Price (show all snapshots)
@@ -159,7 +159,7 @@ def get_contract_highlow(symbol: str) -> dict:
         FROM bronze_options_raw
         WHERE contractSymbol = ?
         AND lastPrice > 0
-        AND HOUR(snapshot_time) BETWEEN 9 AND 23  ## Aug 2026: extended from 18 to 23 UTC — 4:15 PM EST = 21:15 UTC, was being excluded by old upper bound of 18
+        AND HOUR(snapshot_time) BETWEEN 9 AND 23
     """, [symbol])
     if df.empty:                              ## no data yet — return None so chart skips the lines
         return {"contract_high": None, "contract_low": None}
@@ -199,7 +199,7 @@ def get_current_greeks(symbol):
         SELECT delta, theta, gamma
         FROM bronze_options_raw
         WHERE contractSymbol = ?
-        AND HOUR(snapshot_time) BETWEEN 9 AND 23  ## Aug 2026: extended from 18 to 23 UTC — 4:15 PM EST = 21:15 UTC, was being excluded by old upper bound of 18
+        AND HOUR(snapshot_time) BETWEEN 9 AND 23
         ORDER BY snapshot_time DESC
         LIMIT 1
     """, [symbol])
