@@ -317,21 +317,25 @@ try:
             FROM bronze_options_raw o
             LEFT JOIN silver_price_daily p
                    ON p.ticker = o.ticker
-                  AND p.Date   = (
-                      SELECT MAX(Date)
-                      FROM silver_price_daily
-                      WHERE ticker = o.ticker
-                  )
+                  AND p.Date   = DATE(o.snapshot_time)
+                  -- Sep 2026: use snapshot's own date for spot price, not latest date
+                  -- Bug: using MAX(Date) meant every historical snapshot used today's spot ($325)
+                  -- which made pre-2026 snapshots look for ATM strikes in $318-$331 range
+                  -- when AAPL was at $171 — matching deep OTM contracts with near-zero IV
+                  -- Fix: DATE(o.snapshot_time) gives each snapshot its own historical spot price
         ) snap ON snap.ticker = b.ticker
               AND snap.snapshot_str = b.snapshot_str
-        WHERE b.impliedVolatility > 0
+        WHERE b.impliedVolatility > 0.05
+          -- Sep 2026: raised floor from 0 to 0.05 (5%) — real AAPL/INTC IV never below 10%
+          -- pre-market and stale snapshots sometimes return near-zero IV which corrupts iv_rank baseline
           AND b.impliedVolatility < 5
           AND b.strike BETWEEN snap.spot * 0.98
                            AND snap.spot * 1.02
           -- Jun 17 2026: exclude overnight/pre-market snapshots from IV rank calculation
           -- Midnight runs return IV near 0% (bid=ask=0, market closed) which corrupts gold_iv_rank
-          -- Only use snapshots collected between 9 AM and 6 PM (real market hours)
-          AND HOUR(b.snapshot_time) BETWEEN 9 AND 18
+          -- Aug 2026: extended upper bound from 18 to 23 UTC — pipeline moved to droplet (UTC)
+          -- 4:15 PM EST = 21:15 UTC (hour 21), was being excluded by old upper bound of 18
+          AND HOUR(b.snapshot_time) BETWEEN 9 AND 23
         GROUP BY b.ticker, b.snapshot_str, b.snapshot_time
     ),
 

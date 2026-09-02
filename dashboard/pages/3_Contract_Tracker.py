@@ -556,16 +556,7 @@ with ctrl_a:
     chart_type = st.radio("Chart type", ["Line", "Candlestick"], horizontal=True, key="tracker_chart_type")
 
 with ctrl_b:
-    ## Jun 25 2026: replaced single-metric radio with dual-axis toggle + Delta option
-    ## Price + IV always shown together on dual-axis chart (Price left, IV right)
-    ## Delta kept as a separate toggle since it doesn't pair naturally with price
-    if chart_type == "Line":
-        ## Jul 2026: expanded from ["Price + IV", "Delta"] to include Theta and Gamma
-        ## Price + IV = dual-axis (price left, IV right) — most useful for understanding option value
-        ## Delta = directional exposure over time — shows how ATM/OTM the contract was each day
-        ## Theta = time decay over time — shows how fast the option was bleeding each day
-        ## Gamma = delta sensitivity over time — shows when the option was most explosive
-        overlay = st.radio("Overlay", ["Price + IV", "Delta", "Theta", "Gamma"], horizontal=True, key="tracker_metric")
+    pass  ## Aug 2026: overlay radio removed — 2x2 grid shows all metrics simultaneously
 
 with ctrl_c:
     # Timeframe selector — shared across both line and candlestick chart types
@@ -597,203 +588,95 @@ if chart_type == "Candlestick":
         st.warning("Candlestick shows one contract at a time. Displaying first pinned contract.")
     render_candlestick(st.session_state["watchlist"][0], timeframe_days=timeframe_days)
 else:
-    fig    = go.Figure()
+    ## Aug 2026: replaced single chart + overlay radio with 2×2 small multiples grid
+    ## Each panel shows one metric — Price, IV, Delta, Theta — all step charts
+    ## shared_xaxes=True: pan/zoom on any panel moves all four in sync
+    fig    = make_subplots(
+        rows=2, cols=2,
+        shared_xaxes=True,
+        subplot_titles=["Price ($)", "IV %", "Δ Delta", "Θ Theta"],
+        vertical_spacing=0.14,
+        horizontal_spacing=0.10,
+    )
     colors = ["#388bfd","#f0c040","#2ea043","#f85149","#bc8cff","#79c0ff"]  ## color cycle for multiple contracts
+
+    ## Panel definitions — one dict per cell in the 2×2 grid
+    ## col_name: DB column to fetch | mult: multiplier (IV ×100 converts 0.27 → 27%) | fmt: hover decimal format
+    panels = [
+        {"row": 1, "col": 1, "col_name": "lastPrice",        "label": "Price", "unit": "$",  "mult": 1,   "fmt": ".2f"},
+        {"row": 1, "col": 2, "col_name": "impliedVolatility", "label": "IV",    "unit": "%",  "mult": 100, "fmt": ".1f"},
+        {"row": 2, "col": 1, "col_name": "delta",             "label": "Delta", "unit": "",   "mult": 1,   "fmt": ".4f"},
+        {"row": 2, "col": 2, "col_name": "theta",             "label": "Theta", "unit": "",   "mult": 1,   "fmt": ".4f"},
+    ]
+
+    x_start, x_end = None, None  ## track x-axis bounds across all panels — filled during loop
 
     for i, symbol in enumerate(st.session_state["watchlist"]):
         color = colors[i % len(colors)]  ## cycle through colors for each contract
 
-        if overlay in ("Delta", "Theta", "Gamma"):
-            ## Jul 2026: unified Greek chart — Delta, Theta, Gamma all use the same single-axis pattern
-            ## Only the DB column name, y-axis label, and line color differ between them
-            ## This avoids duplicating nearly identical code three times
-
-            ## Map overlay label → DB column name → line color
-            ## col_map: which column in bronze_options_raw to pull for this Greek
-            col_map   = {"Delta": "delta",   "Theta": "theta",   "Gamma": "gamma"}
-            ## color_map: fixed color per Greek so user can identify them by color even across contracts
-            ## Blue = Delta (directional), Red = Theta (decay/negative connotation), Green = Gamma (explosive)
-            color_map = {"Delta": "#388bfd", "Theta": "#f85149", "Gamma": "#2ea043"}
-
-            col        = col_map[overlay]    ## e.g. "delta" — the actual column name to query and plot
-            line_color = color_map[overlay]  ## e.g. "#388bfd" — fixed color for this Greek
-
-            ## get_contract_history with metric_col=col triggers the daily dedup filter
-            ## (one point per day, latest snapshot) — same logic as IV and Delta before
-            df = get_contract_history(symbol, metric_col=col)
-            if df.empty:   ## no data for this contract yet — skip silently
+        for panel in panels:
+            df = get_contract_history(symbol, metric_col=panel["col_name"])  ## dedup logic inside get_contract_history
+            if df.empty:                                                       ## no data for this contract+metric
                 continue
-            df = df.dropna(subset=[col])  ## drop rows where this Greek is NULL (yfinance sometimes omits them)
+            df = df.dropna(subset=[panel["col_name"]])  ## drop NULLs — yfinance sometimes omits Greeks
 
-            ## Timeframe filter: slice from most recent snapshot backwards by timeframe_days
+            ## Timeframe filter — slice from most recent snapshot backwards by timeframe_days
             if timeframe_days is not None:
                 cutoff = pandas.to_datetime(df["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
-                df     = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]  ## keep only rows after cutoff
+                df     = df[pandas.to_datetime(df["snapshot_time"]) >= cutoff]
 
-            ## Single-axis line chart — all Greeks live on the left y-axis
-            ## mode="lines+markers" = connected line with a dot at each daily data point
-            fig.add_trace(go.Scatter(
-                x=df["snapshot_time"],     ## x = snapshot timestamp (one per day after dedup)
-                y=df[col],                 ## y = Greek value (e.g. delta=-0.15, theta=-0.08, gamma=0.02)
-                name=f"{symbol} {overlay}",## legend label e.g. "AAPL260717P00280000 Theta"
-                mode="lines+markers",      ## line connects daily points; dots mark each snapshot
-                line=dict(color=line_color, width=2),   ## fixed Greek color, 2px wide
-                marker=dict(size=5),       ## small dots — visible but not dominating the line
-                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>{overlay}: %{{y:.4f}}<extra></extra>",
-                ## hovertemplate: on hover shows contract symbol, date+time, Greek name and value
-                ## %{{...}} = Plotly format string (double braces escape the f-string outer braces)
-                ## :.4f = 4 decimal places (Greeks are small numbers like -0.0842)
-            ))
-
-            ## x-axis bounds: start at earliest data, end 30 days past last snapshot
-            x_start = pandas.to_datetime(df["snapshot_time"]).min()                               ## left edge of chart
-            x_end   = pandas.to_datetime(df["snapshot_time"]).max() + pandas.Timedelta(days=30)   ## right padding
-
-            fig.update_layout(
-                ## y-axis label matches selected Greek name so axis is self-describing
-                ## zeroline=True draws a horizontal line at y=0 — important for Theta (always negative)
-                ## and Delta (crosses 0 when option flips ITM/OTM)
-                yaxis=dict(title=overlay, gridcolor="#21262d", color="#8b949e", zeroline=True, zerolinecolor="#30363d"),
-            )
-
-        else:
-            ## Jun 25 2026: Price + IV dual-axis mode
-            ## Price (left y-axis, blue) + IV (right y-axis, yellow dotted)
-            ## Lets you see IV crush and price reaction together — most important options relationship
-
-            ## Price — all market-hours snapshots so AM + PM both show (intraday moves visible)
-            df_price = get_contract_history(symbol, metric_col="lastPrice")
-            if df_price.empty:
+            if df.empty:  ## guard: all data may be outside the selected timeframe window
                 continue
-            df_price = df_price.dropna(subset=["lastPrice"])
 
-            ## IV — one snapshot per day (latest only) so no zigzag from multiple daily runs
-            df_iv = get_contract_history(symbol, metric_col="impliedVolatility")
-            if df_iv.empty:
-                continue
-            df_iv = df_iv.dropna(subset=["impliedVolatility"])
+            y_vals = df[panel["col_name"]] * panel["mult"]  ## apply multiplier — IV: 0.27 × 100 = 27
 
-            ## Apply timeframe filter to both dataframes independently
-            if timeframe_days is not None:
-                cutoff_p = pandas.to_datetime(df_price["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
-                df_price = df_price[pandas.to_datetime(df_price["snapshot_time"]) >= cutoff_p]
-                cutoff_i = pandas.to_datetime(df_iv["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
-                df_iv    = df_iv[pandas.to_datetime(df_iv["snapshot_time"]) >= cutoff_i]
+            ## Expand x-axis bounds to cover all panels and all contracts
+            ts = pandas.to_datetime(df["snapshot_time"])
+            if x_start is None:               ## first panel with data — initialize bounds
+                x_start = ts.min()
+                x_end   = ts.max() + pandas.Timedelta(days=30)
+            else:                             ## subsequent panels — expand if data goes further
+                x_start = min(x_start, ts.min())
+                x_end   = max(x_end, ts.max() + pandas.Timedelta(days=30))
 
-            ## Price trace — left y-axis (yaxis="y1"), solid line
+            ## showlegend only on top-left panel — prevents 4× duplicate legend entries per contract
+            show_leg = (panel["row"] == 1 and panel["col"] == 1)
+
             fig.add_trace(go.Scatter(
-                x=df_price["snapshot_time"],   ## x = snapshot timestamp
-                y=df_price["lastPrice"],        ## y = option last price in dollars
-                name=f"{symbol} Price",         ## legend label
-                mode="lines+markers",           ## line + dots at each snapshot
-                line=dict(color=color, width=2),
-                marker=dict(size=5),
-                yaxis="y1",                     ## bind to left y-axis
-                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>Price: $%{{y:.2f}}<extra></extra>",
-            ))
-
-            ## IV trace — right y-axis (yaxis="y2"), dotted yellow line
-            ## Dotted so it's visually distinct from price even without looking at legend
-            ## Multiplied by 100 to convert decimal (0.27) to percentage (27%)
-            fig.add_trace(go.Scatter(
-                x=df_iv["snapshot_time"],              ## x = snapshot timestamp
-                y=df_iv["impliedVolatility"] * 100,    ## y = IV as percentage
-                name=f"{symbol} IV %",                 ## legend label
+                x=df["snapshot_time"],   ## x = snapshot timestamp
+                y=y_vals,                ## y = metric value (multiplier already applied)
+                name=symbol,             ## one legend entry per contract, not per panel
                 mode="lines+markers",
-                line=dict(color="#f0c040", width=2, dash="dot"),  ## yellow dotted — matches IV theme throughout dashboard
-                marker=dict(size=5),
-                yaxis="y2",                            ## bind to RIGHT y-axis
-                hovertemplate=f"{symbol}<br>%{{x|%b %d %H:%M}}<br>IV: %{{y:.1f}}%<extra></extra>",
-            ))
+                line=dict(color=color, width=2, shape="hv"),  ## step chart — honest about discrete AM/PM snapshots
+                marker=dict(size=6),     ## slightly smaller than single-chart (6 vs 8) — panels are smaller
+                showlegend=show_leg,
+                hovertemplate=f"{panel['label']}: %{{y:{panel['fmt']}}}{panel['unit']}<extra>{symbol}</extra>",
+            ), row=panel["row"], col=panel["col"])  ## place trace in correct grid cell
 
-            ## ── Contract high/low reference lines ────────────────────────────
-            ## fetch lifetime high and low for this contract
-            hl = get_contract_highlow(symbol)
-
-            if hl["contract_high"] is not None:
-                ## green dotted line at lifetime high — shows peak price this contract reached
-                fig.add_hline(
-                    y=hl["contract_high"],                                   ## y position = lifetime high price
-                    line_dash="dot",                                         ## dotted so it doesn't overpower price line
-                    line_color="#2ea043",                                    ## green = high
-                    line_width=1,                                            ## thin line — reference only
-                    annotation_text=f"High ${hl['contract_high']:.2f}",     ## label showing exact value
-                    annotation_position="right",                             ## label on the right edge
-                    annotation_font_color="#2ea043",                         ## green label matches line color
+        ## Catalyst vlines — draw on all 4 panels so events are visible in every metric
+        for event_name, event_date in CATALYST_EVENTS.items():
+            for panel in panels:
+                fig.add_vline(
+                    x=event_date, line_width=1, line_dash="dot", line_color="#bc8cff",
+                    row=panel["row"], col=panel["col"]
                 )
 
-            if hl["contract_low"] is not None:
-                ## red dotted line at lifetime low — shows floor the contract hit
-                fig.add_hline(
-                    y=hl["contract_low"],                                    ## y position = lifetime low price
-                    line_dash="dot",                                         ## dotted
-                    line_color="#f85149",                                    ## red = low
-                    line_width=1,                                            ## thin line
-                    annotation_text=f"Low ${hl['contract_low']:.2f}",       ## label showing exact value
-                    annotation_position="right",                             ## label on the right edge
-                    annotation_font_color="#f85149",                         ## red label matches line color
-                )
-
-            ## ── Today's OHLC reference lines ──────────────────────────────────────
-            ## Jul 2026: add today's Open/High/Low/Close as horizontal dashed lines
-            ## dash="dash" visually distinguishes these from contract high/low (dash="dot")
-            ## Loop avoids repeating nearly-identical add_hline calls for each level
-            ohlc = get_today_ohlc(symbol)   ## fetch today's synthesised OHLC for this contract
-            if ohlc:                         ## guard: None if no data yet today
-                for level_val, line_color, annotation_label in [
-                    ## tuple: (price level, line color, annotation text)
-                    (ohlc["open"],  "#8b949e", f"Today O ${ohlc['open']:.2f}"),   ## gray  = open (neutral)
-                    (ohlc["high"],  "#2ea043", f"Today H ${ohlc['high']:.2f}"),   ## green = high
-                    (ohlc["low"],   "#f85149", f"Today L ${ohlc['low']:.2f}"),    ## red   = low
-                    (ohlc["close"], "#f0c040", f"Today C ${ohlc['close']:.2f}"),  ## yellow= close (matches IV theme)
-                ]:
-                    fig.add_hline(
-                        y=level_val,                          ## horizontal line at this price
-                        line_dash="dash",                     ## long dashes — distinct from contract H/L dots
-                        line_color=line_color,                ## color from tuple above
-                        line_width=1,                         ## thin — reference only, not a data trace
-                        annotation_text=annotation_label,     ## e.g. "Today O $2.45" — label on right edge
-                        annotation_position="right",          ## right edge so it doesn't obscure the price line
-                        annotation_font_color=line_color,     ## label color matches line color
-                    )
-
-            ## x-axis range — cap 30 days past last data point
-            x_start = pandas.to_datetime(df_price["snapshot_time"]).min()
-            x_end   = pandas.to_datetime(df_price["snapshot_time"]).max() + pandas.Timedelta(days=30)
-
-            fig.update_layout(
-                ## Left y-axis — Price
-                yaxis=dict(title="Price ($)", gridcolor="#21262d", color="#8b949e", zeroline=False),
-                ## Right y-axis — IV %
-                ## overlaying="y" places it on the same chart area as the left axis
-                ## side="right" pins it to the right edge
-                ## showgrid=False prevents a second grid from overlapping the left grid
-                yaxis2=dict(
-                    title="IV %", overlaying="y", side="right",
-                    color="#f0c040",   ## yellow to match IV line color
-                    showgrid=False,    ## no second grid — would overlap left axis grid
-                    zeroline=False,
-                ),
-            )
-
-    ## Shared layout applied regardless of Price+IV or Delta mode
+    ## Shared layout across all 4 panels
     fig.update_layout(
-        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0", height=400,
-        margin=dict(t=20, b=40, l=60, r=20),
-        xaxis=dict(title="Snapshot Time", gridcolor="#21262d", color="#8b949e", range=[x_start, x_end]),
+        paper_bgcolor="#0e1117", plot_bgcolor="#0e1117", font_color="#e0e0e0",
+        height=550,                ## taller than single chart (was 400) — 2 rows need more space
+        margin=dict(t=40, b=40, l=60, r=20),
         legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
         hovermode="x unified",
     )
+    fig.update_xaxes(gridcolor="#21262d", color="#8b949e")
+    fig.update_yaxes(gridcolor="#21262d", color="#8b949e")
 
-    for event_name, event_date in CATALYST_EVENTS.items():
-        fig.add_vline(x=event_date, line_width=1, line_dash="dot", line_color="#bc8cff")
-        fig.add_annotation(x=event_date, y=1, yref="paper", text=event_name, showarrow=False,
-            font=dict(color="#bc8cff", size=11), bgcolor="#0e1117", bordercolor="#bc8cff",
-            borderwidth=1, xanchor="left", yanchor="top")
+    if x_start and x_end:                          ## only set range if we found data — prevents crash on empty watchlist
+        fig.update_xaxes(range=[x_start, x_end])
 
     st.plotly_chart(fig, use_container_width=True)
-    ## caption shows which overlay is active + how many contracts are on the chart
-    st.caption(f"Data from Bronze layer · {len(st.session_state['watchlist'])} contract(s) tracked · Overlay: {overlay if chart_type == 'Line' else 'Candlestick'}")
+    st.caption(f"Data from Bronze layer · {len(st.session_state['watchlist'])} contract(s) · Step chart — dots = actual snapshots")
 
 ## OI & Volume charts — always shown below main chart regardless of metric/chart type selected
 ## Jun 18 2026: added to track positioning signals around catalyst events

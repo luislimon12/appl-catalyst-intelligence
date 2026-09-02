@@ -4,6 +4,26 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.0] — Session 9 · September 2026
+
+### Bug fix — gold_iv_rank using wrong historical spot price
+
+* `build_silver.py` — `gold_iv_rank` CTE was joining every historical snapshot to `MAX(Date)` spot price (today's closing price ~$325). Snapshots from May 2024 when AAPL was at $171 were therefore looking for ATM strikes in the $318–$331 range — matching deep OTM contracts with near-zero IV. This poisoned the entire iv_rank baseline, causing IV to display as 0.7% when real IV was ~27%.
+* Fix: changed spot join from `p.Date = (SELECT MAX(Date) ...)` to `p.Date = DATE(o.snapshot_time)` so each snapshot uses its own historical closing price to determine ATM strikes.
+* Also raised IV floor filter from `impliedVolatility > 0` to `impliedVolatility > 0.05` (5%) as a permanent safeguard against stale pre-market snapshots returning near-zero IV.
+* After fix: iv_current = 58.4%, iv_rank = 40.6%, snapshot_count = 128 (was 0.7%, poisoned baseline, 95 snapshots).
+
+### Feature — Contract Tracker 2×2 small multiples grid
+
+* `3_Contract_Tracker.py` — replaced single chart + overlay radio (Price+IV / Delta / Theta / Gamma) with a 2×2 grid showing all four metrics simultaneously. Panels: Price ($), IV %, Δ Delta, Θ Theta. All panels share x-axis so pan/zoom moves all four in sync. Catalyst vlines drawn on all four panels.
+* Removed overlay radio button — no longer needed.
+
+### Feature — Step chart for all line traces
+
+* `3_Contract_Tracker.py` — all line chart traces now use `shape="hv"` (step chart). Flat line between snapshots is honest about the fact that we only have 2 data points per day. Marker size increased from 5 to 8 for all traces so each actual snapshot is clearly visible.
+
+---
+
 ## [0.8.0] — Session 8 · August 2026
 
 ### Bug fix — UTC timestamp hour filters in Contract Tracker
