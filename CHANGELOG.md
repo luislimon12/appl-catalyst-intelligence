@@ -4,6 +4,20 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.1] — Session 9 continued · September 2026
+
+### Optimization — prev_iv moved from Bronze runtime scan to Gold layer
+
+* `build_silver.py` — added `prev_iv_cte` to the `gold_iv_rank` query. Uses `ROW_NUMBER() OVER (PARTITION BY ticker ORDER BY MAX(snapshot_time) DESC)` to rank market-hours snapshots newest to oldest, selects the second most recent (`rn=2`), and averages its call IV. Result stored as `prev_iv` column in `gold_iv_rank`.
+* `app.py` — removed 13-line `prev_df` Bronze subquery from `render_iv_cards()`. Replaced with `float(row["prev_iv"])` read from the Gold row already in memory. Eliminates a full 467k-row `bronze_options_raw` scan on every dashboard page load.
+* `app.py` — uses `pandas.notna(row.get("prev_iv"))` guard so `None` is handled gracefully when only one snapshot exists (e.g. first run of the day).
+
+### Bug fix — `Timestamp.now()` UTC offset in Options Chain
+
+* `2_Options_Chain.py` — catalyst DTE calculation used `pandas.Timestamp.now()` which returns UTC on the droplet. After 8 PM EDT this made `now()` be already tomorrow in UTC, causing DTE to show one day short. Fixed to `pandas.Timestamp.today()` which returns midnight of the local calendar date regardless of timezone.
+
+---
+
 ## [0.9.0] — Session 9 · September 2026
 
 ### Bug fix — gold_iv_rank using wrong historical spot price

@@ -110,20 +110,8 @@ def render_iv_cards(ticker: str):
     snap_count = int(row["snapshot_count"])     ## total snapshots used to compute rank/percentile
     snap_time  = str(row["snapshot_time"])[:16] ## latest snapshot timestamp, trimmed to minute
 
-    prev_df = query(
-        """
-        SELECT AVG(impliedVolatility) as prev_iv
-        FROM bronze_options_raw
-        WHERE ticker = ? AND impliedVolatility > 0.01 AND option_type = 'call'
-          AND snapshot_str = (
-              SELECT snapshot_str FROM bronze_options_raw
-              WHERE ticker = ? AND impliedVolatility > 0.01
-              GROUP BY snapshot_str ORDER BY MAX(snapshot_time) DESC
-              LIMIT 1 OFFSET 1  -- OFFSET 1 skips the latest, giving us the previous snapshot
-          )
-        """, [ticker, ticker]
-    )
-    prev_iv  = float(prev_df.iloc[0]["prev_iv"]) if not prev_df.empty else None  ## None if no previous snapshot
+    ## Sep 2026: prev_iv pre-computed in Gold layer (build_silver.py prev_iv_cte) — no Bronze scan at runtime
+    prev_iv  = float(row["prev_iv"]) if pandas.notna(row.get("prev_iv")) else None  ## None if only one snapshot exists
     iv_delta = (iv_current - prev_iv) if prev_iv else None  ## change vs previous snapshot, None if unavailable
 
     m1, m2, m3, m4 = st.columns(4)  ## 4 equal cards — now inside 2/3-width column so values have room

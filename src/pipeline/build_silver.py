@@ -386,6 +386,35 @@ try:
         FROM atm_iv_per_snapshot a
         JOIN iv_stats s ON s.ticker = a.ticker           -- join to get iv_current
         GROUP BY a.ticker, s.iv_current                  -- group by ticker + current IV
+    ),
+
+    prev_iv_cte AS (
+        -- Sep 2026: average call IV from the second most recent market-hours snapshot
+        -- used by dashboard to show IV change vs previous snapshot without a heavy Bronze scan
+        -- moved here from app.py so dashboard just reads pre-computed Gold value
+        SELECT
+            ticker,
+            AVG(impliedVolatility) AS prev_iv
+        FROM bronze_options_raw
+        WHERE option_type = 'call'
+          AND impliedVolatility > 0.01
+          AND HOUR(snapshot_time) BETWEEN 9 AND 23
+          AND snapshot_str IN (
+              -- rank all market-hours snapshots newest to oldest, pick rank 2 (previous)
+              SELECT snapshot_str
+              FROM (
+                  SELECT ticker, snapshot_str,
+                         ROW_NUMBER() OVER (
+                             PARTITION BY ticker
+                             ORDER BY MAX(snapshot_time) DESC
+                         ) AS rn
+                  FROM bronze_options_raw
+                  WHERE HOUR(snapshot_time) BETWEEN 9 AND 23
+                  GROUP BY ticker, snapshot_str
+              )
+              WHERE rn = 2          -- rn=1 is latest, rn=2 is the one before it
+          )
+        GROUP BY ticker
     )
 
     SELECT
@@ -401,10 +430,12 @@ try:
         z.iv_zscore,                                             -- Jul 2026: added Z-score column
         s.snapshot_count,
         (SELECT MAX(snapshot_time) FROM atm_iv_per_snapshot
-         WHERE ticker = s.ticker)                                AS snapshot_time
+         WHERE ticker = s.ticker)                                AS snapshot_time,
+        p2.prev_iv                                               -- Sep 2026: previous snapshot IV, pre-computed in Gold layer
     FROM iv_stats s
-    JOIN iv_percentile p ON p.ticker = s.ticker
-    JOIN iv_zscore     z ON z.ticker = s.ticker                  -- join Z-score CTE
+    JOIN iv_percentile  p  ON p.ticker  = s.ticker
+    JOIN iv_zscore      z  ON z.ticker  = s.ticker               -- join Z-score CTE
+    LEFT JOIN prev_iv_cte p2 ON p2.ticker = s.ticker             -- Sep 2026: join pre-computed prev_iv
     """)
 
     iv_count       = con.execute("SELECT COUNT(*) FROM gold_iv_rank").fetchone()[0]
