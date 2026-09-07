@@ -12,6 +12,10 @@ All significant changes documented in reverse chronological order.
 * `app.py` — removed 13-line `prev_df` Bronze subquery from `render_iv_cards()`. Replaced with `float(row["prev_iv"])` read from the Gold row already in memory. Eliminates a full 467k-row `bronze_options_raw` scan on every dashboard page load.
 * `app.py` — uses `pandas.notna(row.get("prev_iv"))` guard so `None` is handled gracefully when only one snapshot exists (e.g. first run of the day).
 
+### Bug fix — pipeline running on 2027 market holidays
+
+* `collect_market_snapshots.py` — `MARKET_HOLIDAYS` only contained 2026 dates. Pipeline would have run on every 2027 holiday (New Year's, MLK, Presidents Day, etc.) and collected garbage pre-market snapshots. Added all 2027 NYSE holidays with observed-date notes (e.g. July 4 falls on Sunday → observed Monday July 5).
+
 ### Bug fix — `Timestamp.now()` UTC offset in Options Chain
 
 * `2_Options_Chain.py` — catalyst DTE calculation used `pandas.Timestamp.now()` which returns UTC on the droplet. After 8 PM EDT this made `now()` be already tomorrow in UTC, causing DTE to show one day short. Fixed to `pandas.Timestamp.today()` which returns midnight of the local calendar date regardless of timezone.

@@ -21,8 +21,9 @@ import yfinance as yf
 from price_metrics import clean_price, calculate_hv
 from option_metrics import calculate_greeks
 
-## US market holidays for 2026 — extend annually
+## US market holidays — extend annually each December
 MARKET_HOLIDAYS = {
+    ## 2026
     date(2026, 1, 1),   ## New Year's Day
     date(2026, 1, 19),  ## MLK Day
     date(2026, 2, 16),  ## Presidents Day
@@ -33,6 +34,17 @@ MARKET_HOLIDAYS = {
     date(2026, 11, 26), ## Thanksgiving
     date(2026, 11, 27), ## Day after Thanksgiving (early close — skip for safety)
     date(2026, 12, 25), ## Christmas
+    ## 2027 — Sep 2026: added to prevent snapshots on market-closed days
+    date(2027, 1, 1),   ## New Year's Day
+    date(2027, 1, 18),  ## MLK Day
+    date(2027, 2, 15),  ## Presidents Day
+    date(2027, 3, 26),  ## Good Friday
+    date(2027, 5, 31),  ## Memorial Day
+    date(2027, 7, 5),   ## Independence Day (observed, July 4 falls on Sunday)
+    date(2027, 9, 6),   ## Labor Day
+    date(2027, 11, 25), ## Thanksgiving
+    date(2027, 11, 26), ## Day after Thanksgiving (early close — skip for safety)
+    date(2027, 12, 24), ## Christmas (observed, Dec 25 falls on Saturday)
 }
 
 ## Tickers to collect — add or remove here

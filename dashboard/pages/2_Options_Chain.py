@@ -120,7 +120,10 @@ def render_term_structure(ticker, spot):
         return
 
     ## NEW: compute DTE — integer days from today to each expiry
-    df["dte"] = (pandas.to_datetime(df["expiry"]) - pandas.Timestamp.now()).dt.days
+    ## Aug 2026: changed from Timestamp.now() to Timestamp.today()
+    ## Timestamp.now() returns UTC on the droplet — after midnight UTC (8 PM EDT) DTE is off by 1 day
+    ## Timestamp.today() returns midnight of the current date with no time component — always correct
+    df["dte"] = (pandas.to_datetime(df["expiry"]) - pandas.Timestamp.today()).dt.days
 
     ## NEW: filter DTE < 7 — near-expiry options have artificially inflated IV
     ## annualization math (IV × √252) blows up when DTE approaches 0 — not real signal
@@ -184,7 +187,7 @@ def render_term_structure(ticker, spot):
     ## REMOVED: pandas.to_datetime(date) <= x_end date check
     ## REPLACED WITH: DTE range check (7 to 540)
     for event_name, event_date in CATALYST_EVENTS.items():
-        cat_dte = (pandas.to_datetime(event_date) - pandas.Timestamp.now()).days
+        cat_dte = (pandas.to_datetime(event_date) - pandas.Timestamp.today()).days  ## Sep 2026: was Timestamp.now() which returns UTC on droplet — off by 1 day after 8 PM EDT
         if 7 <= cat_dte <= 540:           ## only show if within our DTE window
             fig.add_vline(x=cat_dte, line_width=1, line_dash="dot", line_color="#bc8cff")
             fig.add_annotation(
