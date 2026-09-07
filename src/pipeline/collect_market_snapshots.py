@@ -11,6 +11,7 @@ import os
 import sys
 import subprocess
 import logging
+import zoneinfo                          ## Sep 2026: stdlib (Python 3.9+) — used for EST timezone in is_market_open()
 from datetime import datetime, date
 
 import pandas as pd
@@ -195,11 +196,13 @@ class MarketSnapshotCollector:
 
     def is_market_open(self) -> bool:
         ## Returns True on weekdays that are not US market holidays
-        now   = datetime.now()
-        today = now.date()
+        ## Sep 2026: use America/New_York explicitly — droplet runs UTC so datetime.now() returns UTC
+        ## zoneinfo is stdlib (Python 3.9+) — no extra install needed
+        now   = datetime.now(tz=zoneinfo.ZoneInfo("America/New_York"))
+        today = now.date()                  ## EST/EDT date — correct for holiday and weekend checks
         if today in MARKET_HOLIDAYS:
             return False
-        return now.weekday() < 5
+        return now.weekday() < 5            ## 0=Mon … 4=Fri, 5=Sat, 6=Sun
 
     # ── ORCHESTRATOR ──────────────────────────────────────────────────────────
 
