@@ -59,8 +59,10 @@ DARK_THEME_CSS = """
 @st.cache_resource
 def get_connection():
     # cache_resource keeps one connection alive for the whole session
-    # read_only prevents any accidental writes from the dashboard
-    return duckdb.connect(str(DB_PATH), read_only=True)
+    # Sep 2026: removed read_only=True — manual H/L form needs write access from same process
+    # DuckDB raises "different configuration" error if a read-write connect is attempted
+    # while a read_only=True connection is already open in the same process
+    return duckdb.connect(str(DB_PATH))
 
 def query(sql: str, params=None) -> pandas.DataFrame:
     con = get_connection()
