@@ -201,6 +201,27 @@ def get_contract_highlow(symbol: str) -> dict:
         return {"contract_high": None, "contract_low": None}
     return df.iloc[0].to_dict()              ## return as dict e.g. {"contract_high": 8.20, "contract_low": 0.50}
 
+def get_prev_close(symbol: str) -> float | None:
+    ## Fetch yesterday's 4:15 PM snapshot price — the market's last settled price before today
+    ## This is the reference anchor for overnight gap (Open − Prev Close) and session return (Close − Prev Close)
+    ## "Yesterday" = the most recent trading day before today — skips weekends and holidays automatically
+    ## because we only have snapshots on days the pipeline ran (market days only)
+    df = query(
+        """
+        SELECT lastPrice
+        FROM bronze_options_raw
+        WHERE contractSymbol = ?
+          AND lastPrice > 0                        -- exclude zero prints
+          AND HOUR(snapshot_time) >= 17            -- PM snapshot only (4:15 PM EST = 21:15 UTC, hour >= 17 covers it)
+          AND DATE(snapshot_time) < CURRENT_DATE   -- strictly before today — excludes today's AM/PM snapshots
+        ORDER BY snapshot_time DESC                -- most recent first
+        LIMIT 1                                    -- only the single most recent prior PM snapshot
+        """, [symbol]
+    )
+    if df.empty:                                   ## no prior PM snapshot — first day of data
+        return None
+    return float(df.iloc[0]["lastPrice"])          ## return as plain float for arithmetic in metric cards
+
 def get_today_ohlc(symbol: str) -> dict:
     ## reuse get_ohlc_data() which already builds open/high/low/close from AM+PM snapshots
     ## grab the most recent row = latest trading day with both AM and PM snapshots
@@ -549,41 +570,85 @@ if st.session_state["watchlist"]:
     st.divider()                                                       ## visual separator before chart controls
 
 # ── Today's OHLC metric cards ─────────────────────────────────────────────────
-## Jul 2026: shows Open/High/Low/Close for the first pinned contract
-## OHLC is synthesised from two snapshots: AM (≈9:35) = open, PM (≈4:15) = close
-## High and Low are the max/min lastPrice seen across ALL snapshots that day
-## Only renders when the watchlist has at least one contract
+## Sep 2026: 5-card layout — Prev Close as primary reference anchor
+## Prev Close = yesterday's PM snapshot — baseline for overnight gap and session return
+## High/Low = manual entry only (from ✏️ form below) — show "—" until user enters them
 if st.session_state["watchlist"]:
     ohlc_today = get_today_ohlc(st.session_state["watchlist"][0])  ## pull OHLC for first pinned contract
-    if ohlc_today:                                                  ## guard: None when no data for today
-        st.caption(                                                 ## small note explaining data source
+    prev_close = get_prev_close(st.session_state["watchlist"][0])  ## yesterday's PM snapshot price — our reference anchor
+    if ohlc_today:
+        st.caption(
             f"📅 {ohlc_today['date']} · Open = 9:35 AM snapshot · Close = 4:15 PM snapshot"
         )
-        c1, c2, c3, c4 = st.columns(4)                            ## four equal columns, one card per OHLC field
+        c1, c2, c3, c4, c5 = st.columns(5)  ## 5 equal cards — one per OHLC field + Prev Close
 
-        c1.metric("Open",  f"${ohlc_today['open']:.2f}")          ## morning price — no delta (nothing to compare to)
-
-        c2.metric(                                                  ## High card: delta = how far above open
-            "High",
-            f"${ohlc_today['high']:.2f}",
-            delta=f"+${ohlc_today['high'] - ohlc_today['open']:.2f} from open",  ## positive $ move from open
-            delta_color="normal"                                    ## green = higher than open is good
+        ## ── 1. PREV CLOSE — Reference point ──────────────────────────────────
+        ## Yesterday's 4:15 PM snapshot — the market's last agreed price before today
+        ## No delta shown — this IS the baseline everything else compares against
+        ## If None (first day of data), show "—" so card still renders cleanly
+        c1.metric(
+            "Prev Close",
+            f"${prev_close:.2f}" if prev_close else "—"
         )
 
-        c3.metric(                                                  ## Low card: delta = how far below open
-            "Low",
-            f"${ohlc_today['low']:.2f}",
-            delta=f"-${ohlc_today['open'] - ohlc_today['low']:.2f} from open",   ## negative $ move from open
-            delta_color="inverse"                                   ## inverse: red means lower than open (expected for Low)
-        )
+        ## ── 2. OPEN — Overnight gap ───────────────────────────────────────────
+        ## Today's 9:35 AM snapshot — first price we captured after market opened
+        ## Delta = Open − Prev Close = how much the contract moved while market was closed
+        ## Positive gap = opened higher than yesterday (bullish overnight news/sentiment)
+        ## Negative gap = opened lower (bearish overnight — earnings, macro, etc.)
+        ## delta_color="normal" = green when positive (gapped up = favorable for long calls)
+        if prev_close and ohlc_today["open"]:
+            c2.metric(
+                "Open",
+                f"${ohlc_today['open']:.2f}",
+                delta=f"{ohlc_today['open'] - prev_close:+.2f} overnight gap",
+                delta_color="normal"   ## green = gapped up, red = gapped down
+            )
+        else:
+            c2.metric("Open", f"${ohlc_today['open']:.2f}")  ## no prev close yet — show price only
 
-        close_delta = ohlc_today['close'] - ohlc_today['open']     ## end-of-day P&L vs morning price
-        c4.metric(                                                  ## Close card: shows net day move
-            "Close",
-            f"${ohlc_today['close']:.2f}",
-            delta=f"{close_delta:+.2f} vs open",                   ## +/- format shows direction clearly
-            delta_color="normal"                                    ## green = closed above open (profitable long)
-        )
+        ## ── 3. HIGH — Max favorable excursion from open ──────────────────────
+        ## Entered manually via ✏️ form — shows "—" until user enters today's high from broker
+        ## Delta = High − Open = how far above open the contract ran at its peak
+        ## delta_color="normal" = green because higher than open is favorable for longs
+        if ohlc_today["open"] and ohlc_today["high"]:
+            c3.metric(
+                "High",
+                f"${ohlc_today['high']:.2f}",
+                delta=f"+${ohlc_today['high'] - ohlc_today['open']:.2f} from open",
+                delta_color="normal"   ## green = ran above open
+            )
+        else:
+            c3.metric("High", "—")    ## no manual entry yet — prompt user to use ✏️ form below
+
+        ## ── 4. LOW — Max adverse excursion from open ─────────────────────────
+        ## Entered manually via ✏️ form — shows "—" until user enters today's low from broker
+        ## Delta = Open − Low = how far below open the contract fell at its worst
+        ## delta_color="inverse" = red because lower than open is adverse for longs
+        if ohlc_today["open"] and ohlc_today["low"]:
+            c4.metric(
+                "Low",
+                f"${ohlc_today['low']:.2f}",
+                delta=f"-${ohlc_today['open'] - ohlc_today['low']:.2f} from open",
+                delta_color="inverse"  ## inverse: red means lower than open (expected for Low)
+            )
+        else:
+            c4.metric("Low", "—")     ## no manual entry yet — prompt user to use ✏️ form below
+
+        ## ── 5. CLOSE — Complete session-to-session return ────────────────────
+        ## Today's 4:15 PM snapshot — final price of the trading day
+        ## Delta = Close − Prev Close = net move from yesterday's close to today's close
+        ## This is the number that shows on your broker watchlist as today's P&L
+        ## delta_color="normal" = green when positive (gained value vs yesterday)
+        if prev_close and ohlc_today["close"]:
+            c5.metric(
+                "Close",
+                f"${ohlc_today['close']:.2f}",
+                delta=f"{ohlc_today['close'] - prev_close:+.2f} session return",
+                delta_color="normal"   ## green = closed above yesterday, red = closed below
+            )
+        else:
+            c5.metric("Close", f"${ohlc_today['close']:.2f}")  ## no prev close yet — show price only
 
 # ── Manual H/L entry form ────────────────────────────────────────────────────
 ## Only shown when a contract is pinned AND we have today's OHLC data to anchor the date

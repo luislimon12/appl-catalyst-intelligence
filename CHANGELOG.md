@@ -4,6 +4,16 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.4] — Session 9 continued · September 2026
+
+### Feature — 5-card OHLC layout with Prev Close as reference anchor
+
+* `3_Contract_Tracker.py` — added `get_prev_close()` — queries the most recent PM snapshot (`HOUR >= 17`) before today (`DATE < CURRENT_DATE`) for the pinned contract. Returns `None` on first day of data.
+* `3_Contract_Tracker.py` — replaced 4-card OHLC section with 5-card layout: Prev Close → Open → High → Low → Close. Prev Close is the primary reference point — no delta shown (it IS the baseline). Open shows overnight gap (Open − Prev Close). High/Low show delta from open; display "—" if no manual entry yet. Close shows session return (Close − Prev Close).
+* High and Low are manual-entry only — pipeline captures only 2 snapshots/day so synthetic H/L is misleading. Cards prompt user to use the ✏️ form below until broker values are entered.
+
+---
+
 ## [0.9.3] — Session 9 continued · September 2026
 
 ### Feature — Manual H/L override form in Contract Tracker
