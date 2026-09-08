@@ -4,6 +4,18 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.5] — Session 9 continued · September 2026
+
+### Bug fixes — manual H/L form and OHLC cards (5 issues)
+
+* `3_Contract_Tracker.py` — `INSERT OR REPLACE` is SQLite syntax; DuckDB requires `ON CONFLICT DO UPDATE SET`. Would have thrown a syntax error on every form submit. Fixed to `INSERT INTO ... ON CONFLICT (symbol, date) DO UPDATE SET`.
+* `3_Contract_Tracker.py` — partial H/L save was corrupting existing data: saving only High wrote `low=0.0`, then saving only Low wrote `high=0.0`, erasing the previously saved value. Fixed with `CASE WHEN excluded.high > 0 THEN excluded.high ELSE manual_ohlc_overrides.high END` — only overwrites a field if the new value is > 0.
+* `3_Contract_Tracker.py` — `f"${ohlc_today['open']:.2f}"` and `f"${ohlc_today['close']:.2f}"` raised `TypeError` when open/close was `None` (no AM or PM snapshot yet today). Added `is not None` guards with `"—"` fallback on both cards.
+* `3_Contract_Tracker.py` — `get_prev_close()` was missing `@st.cache_data(ttl=60)`. Every Streamlit rerun (button click, sidebar change, auto-refresh) fired a new DB query. Added cache decorator matching all other helpers.
+* `3_Contract_Tracker.py` — `if prev_close and ohlc_today["open"]:` and equivalent checks used float truthiness — `0.0` evaluates `False`, skipping the delta for near-zero priced options. Replaced all four checks with explicit `is not None`.
+
+---
+
 ## [0.9.4] — Session 9 continued · September 2026
 
 ### Feature — 5-card OHLC layout with Prev Close as reference anchor
