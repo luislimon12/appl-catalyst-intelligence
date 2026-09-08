@@ -43,10 +43,12 @@ def load_ohlc_override(symbol: str, date: str) -> dict:
     except Exception:
         return {}                 ## table doesn't exist yet — fall back to synthesised values
 
-def write_manual_hl(symbol: str, date: str, high: float, low: float) -> bool:
+def write_manual_hl(symbol: str, date: str, high: float, low: float) -> tuple[bool, str]:
     ## Write user-entered H/L to manual_ohlc_overrides table
     ## Uses a short-lived read-write connection — held for milliseconds then released
     ## Retries 3 times with 2s gap to survive the pipeline's ~30s write window at 9:35 AM / 4:15 PM
+    ## Returns (True, "") on success or (False, error_message) on failure for caller to display
+    last_error = ""                                       ## capture real exception message for diagnosis
     for attempt in range(3):                              ## 3 attempts = 6 seconds max wait
         try:
             con = duckdb.connect(str(DB_PATH))            ## read-write — no read_only flag
@@ -72,14 +74,15 @@ def write_manual_hl(symbol: str, date: str, high: float, low: float) -> bool:
                            END
             """, [symbol, date, high, low])
             con.close()                                   ## release write lock immediately
-            return True                                   ## success
-        except Exception:
+            return True, ""                               ## success
+        except Exception as e:
+            last_error = str(e)                           ## capture real error — not swallowed
             try:
                 con.close()                               ## always release — even if write failed mid-way
             except Exception:
                 pass                                      ## con may not have opened — safe to ignore
             time.sleep(2)                                 ## wait 2s before next attempt
-    return False                                          ## all 3 attempts failed — pipeline still running
+    return False, last_error                              ## all 3 attempts failed — return real error to caller
 
 def load_watchlist(ticker: str) -> list:
     ## called on page load to restore saved contracts from disk
@@ -703,7 +706,7 @@ if st.session_state["watchlist"] and ohlc_today:
             if high_val and low_val and high_val < low_val:   ## basic sanity check
                 st.error("High must be ≥ Low.")
             elif high_val or low_val:                          ## at least one field filled
-                success = write_manual_hl(
+                success, err = write_manual_hl(
                     symbol_0, today_str,
                     high_val or 0.0,                      ## send 0.0 if only one field filled
                     low_val  or 0.0,
@@ -713,7 +716,7 @@ if st.session_state["watchlist"] and ohlc_today:
                     st.cache_data.clear()                 ## force OHLC cards to re-query with new values
                     st.rerun()                            ## refresh page so cards update immediately
                 else:
-                    st.error("Pipeline is running — try again in a few seconds.")
+                    st.error(f"Write failed: {err}")      ## show real DuckDB error for diagnosis
             else:
                 st.warning("Enter at least one value.")
 
