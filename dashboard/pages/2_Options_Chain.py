@@ -123,7 +123,11 @@ def render_term_structure(ticker, spot):
     ## Aug 2026: changed from Timestamp.now() to Timestamp.today()
     ## Timestamp.now() returns UTC on the droplet — after midnight UTC (8 PM EDT) DTE is off by 1 day
     ## Timestamp.today() returns midnight of the current date with no time component — always correct
-    df["dte"] = (pandas.to_datetime(df["expiry"]) - pandas.Timestamp.today()).dt.days
+    ## Sep 2026: use date_type.today() wrapped in Timestamp to force midnight (00:00:00)
+    ## Timestamp.today() returns current datetime with time component — at 2:30 PM,
+    ## (tomorrow_midnight - today_2:30pm).days = 0, making tomorrow show DTE=0 instead of 1
+    ## Timestamp(date_type.today()) = midnight of today → DTE is always a clean integer
+    df["dte"] = (pandas.to_datetime(df["expiry"]) - pandas.Timestamp(date_type.today())).dt.days
 
     ## NEW: filter DTE < 7 — near-expiry options have artificially inflated IV
     ## annualization math (IV × √252) blows up when DTE approaches 0 — not real signal

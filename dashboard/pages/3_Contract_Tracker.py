@@ -59,8 +59,13 @@ def save_watchlist(ticker: str, watchlist: list):
         with open(WATCHLIST_FILE, "r") as f:
             data = json.load(f)              ## load existing data so other tickers aren't erased
     data[ticker] = watchlist                 ## overwrite only this ticker's list
-    with open(WATCHLIST_FILE, "w") as f:     ## open file in write mode (creates if missing)
-        json.dump(data, f, indent=2)         ## json.dump converts dict to JSON text, indent=2 = human readable
+    ## Sep 2026: wrapped in try/except — Docker volume may be read-only or disk full;
+    ## without this the write fails silently and watchlist is lost on container restart
+    try:
+        with open(WATCHLIST_FILE, "w") as f:     ## open file in write mode (creates if missing)
+            json.dump(data, f, indent=2)         ## json.dump converts dict to JSON text, indent=2 = human readable
+    except Exception as e:
+        st.warning(f"Could not save watchlist to disk: {e} — watchlist will reset on restart.")
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Contract Tracker · Catalyst Intelligence", page_icon="🔍", layout="wide", initial_sidebar_state="expanded")
@@ -672,7 +677,7 @@ else:
     fig.update_xaxes(gridcolor="#21262d", color="#8b949e")
     fig.update_yaxes(gridcolor="#21262d", color="#8b949e")
 
-    if x_start and x_end:                          ## only set range if we found data — prevents crash on empty watchlist
+    if x_start is not None and x_end is not None:  ## Sep 2026: explicit None check — Timestamp is truthy but intent is clearer this way
         fig.update_xaxes(range=[x_start, x_end])
 
     st.plotly_chart(fig, use_container_width=True)

@@ -32,6 +32,11 @@ def calculate_greeks(
     df     = df.copy()
     greeks = {"delta": [], "gamma": [], "theta": [], "vega": []}
 
+    ## Sep 2026: compute now_eastern once before the loop — was inside the loop which called the
+    ## system clock for every row (500+ times per chain). Single call ensures all rows in the
+    ## same batch use the same reference time, making T consistent across contracts.
+    now_eastern = pd.Timestamp.now(tz="America/New_York")
+
     for _, row in df.iterrows():
         try:
             S           = spot_price
@@ -44,7 +49,6 @@ def calculate_greeks(
 
             ## Anchor to 4 PM close on expiry day; floor at 1/365 to prevent T=0
             expiry_close = pd.to_datetime(row["expiry"]).tz_localize("America/New_York") + pd.Timedelta(hours=16)
-            now_eastern  = pd.Timestamp.now(tz="America/New_York")
             T = max(
                 (expiry_close - now_eastern).total_seconds() / (365 * 24 * 3600),
                 1 / 365

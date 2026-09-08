@@ -9,6 +9,7 @@ Session 3 (Jun 2026):
 """
 
 import sys
+import time
 from pathlib import Path
 
 # Add dashboard folder to path so utils.py is importable from pages/ too
@@ -111,7 +112,9 @@ def render_iv_cards(ticker: str):
     snap_time  = str(row["snapshot_time"])[:16] ## latest snapshot timestamp, trimmed to minute
 
     ## Sep 2026: prev_iv pre-computed in Gold layer (build_silver.py prev_iv_cte) — no Bronze scan at runtime
-    prev_iv  = float(row["prev_iv"]) if pandas.notna(row.get("prev_iv")) else None  ## None if only one snapshot exists
+    ## Sep 2026: check column exists first — old Docker image without prev_iv column would cause
+    ## row.get("prev_iv") to return None, pandas.notna(None) = True, then row["prev_iv"] raises KeyError
+    prev_iv  = float(row["prev_iv"]) if "prev_iv" in row and pandas.notna(row["prev_iv"]) else None  ## None if only one snapshot exists
     iv_delta = (iv_current - prev_iv) if prev_iv else None  ## change vs previous snapshot, None if unavailable
 
     m1, m2, m3, m4 = st.columns(4)  ## 4 equal cards — now inside 2/3-width column so values have room
@@ -306,7 +309,6 @@ st.subheader("⚡ Gamma Exposure (GEX)")
 render_gex(ticker)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
-import time
 if refresh_secs:
     time.sleep(refresh_secs)
     st.rerun()

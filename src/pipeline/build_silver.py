@@ -329,8 +329,11 @@ try:
           -- Sep 2026: raised floor from 0 to 0.05 (5%) — real AAPL/INTC IV never below 10%
           -- pre-market and stale snapshots sometimes return near-zero IV which corrupts iv_rank baseline
           AND b.impliedVolatility < 5
-          AND b.strike BETWEEN snap.spot * 0.98
-                           AND snap.spot * 1.02
+          AND b.strike BETWEEN snap.spot * 0.95
+                           AND snap.spot * 1.05
+          -- Sep 2026: widened from ±2% to ±5% — INTC trades at ~$20 with $1 strike spacing
+          -- ±2% = ±$0.40 for INTC which often captures zero strikes when price sits between strikes
+          -- ±5% = ±$1 for INTC (1–2 strikes) and ±$16 for AAPL (still reasonable ATM window)
           -- Jun 17 2026: exclude overnight/pre-market snapshots from IV rank calculation
           -- Midnight runs return IV near 0% (bid=ask=0, market closed) which corrupts gold_iv_rank
           -- Aug 2026: extended upper bound from 18 to 23 UTC — pipeline moved to droplet (UTC)

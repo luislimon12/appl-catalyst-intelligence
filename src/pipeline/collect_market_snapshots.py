@@ -15,9 +15,7 @@ import zoneinfo                          ## Sep 2026: stdlib (Python 3.9+) — u
 from datetime import datetime, date
 
 import pandas as pd
-import numpy as np
-from scipy.stats import norm
-import yfinance as yf
+import yfinance as yf  ## Sep 2026: removed unused numpy and scipy.stats imports — math lives in option_metrics.py
 
 from price_metrics import clean_price, calculate_hv
 from option_metrics import calculate_greeks
@@ -140,8 +138,25 @@ class MarketSnapshotCollector:
 
         self.logger.info(f"Fetching {len(expiries)} expiries for {self.ticker}")
 
-        spot_price = self.asset.history(period="1d")["Close"].iloc[-1]
+        ## Sep 2026: guard against empty history — yfinance can return empty DataFrame on network errors,
+        ## rate limits, or holidays. Without this check, .iloc[-1] raises IndexError and silently drops
+        ## the entire options collection for this run.
+        price_hist = self.asset.history(period="1d")
+        if price_hist.empty:
+            self.logger.error("Could not fetch spot price — yfinance returned empty history. Skipping options collection.")
+            return None
+        spot_price = price_hist["Close"].iloc[-1]
         self.logger.info(f"Spot price: {spot_price:.2f}")
+
+        ## Sep 2026: fetch live 13-week T-bill rate — ^IRX returns annualized % (e.g. 4.25 = 4.25%)
+        ## fallback to 0.043 if fetch fails (current approximate rate as of Sep 2026)
+        try:
+            irx = yf.Ticker("^IRX").fast_info["last_price"]   ## annualized yield in percent
+            r   = irx / 100                                    ## convert to decimal (4.25 → 0.0425)
+            self.logger.info(f"Risk-free rate: {r:.4f} (from ^IRX)")
+        except Exception:
+            r   = 0.043                                        ## fallback if ^IRX unavailable
+            self.logger.warning("^IRX fetch failed — using fallback r=0.043")
 
         options_list = []
 
@@ -161,6 +176,7 @@ class MarketSnapshotCollector:
                 combined = calculate_greeks(
                     combined,
                     spot_price=spot_price,
+                    r=r,                        ## Sep 2026: live T-bill rate instead of hardcoded 0.05
                     logger=self.logger          ## pass logger so Greeks failures appear in log
                 )
                 combined = self.add_metadata(combined)
@@ -219,6 +235,16 @@ class MarketSnapshotCollector:
 
 
 if __name__ == "__main__":
+    ## Sep 2026: module-level logger for the orchestrator block — root logger has no handlers
+    ## configured so logging.info() produced no output on the droplet; named logger inherits
+    ## the handler set up inside MarketSnapshotCollector.__init__() via the root handler chain
+    pipeline_logger = logging.getLogger("pipeline")
+    handler   = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
+    handler.setFormatter(formatter)
+    pipeline_logger.addHandler(handler)
+    pipeline_logger.setLevel(logging.INFO)
+
     for ticker in TICKERS:
         collector = MarketSnapshotCollector(ticker=ticker)
         collector.run()
@@ -227,10 +253,10 @@ if __name__ == "__main__":
     pipeline_dir = os.path.dirname(os.path.abspath(__file__))
     python       = sys.executable  ## always use the same Python that's running this script
 
-    logging.info("Running build_database.py...")
+    pipeline_logger.info("Running build_database.py...")
     subprocess.run([python, os.path.join(pipeline_dir, "build_database.py")], check=True)
 
-    logging.info("Running build_silver.py...")
+    pipeline_logger.info("Running build_silver.py...")
     subprocess.run([python, os.path.join(pipeline_dir, "build_silver.py")], check=True)
 
-    logging.info("Pipeline complete — Gold tables updated.")
+    pipeline_logger.info("Pipeline complete — Gold tables updated.")

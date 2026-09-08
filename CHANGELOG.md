@@ -4,6 +4,22 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.2] — Session 9 continued · September 2026
+
+### Bug fixes — full file scan (11 issues)
+
+* `collect_market_snapshots.py` — `spot_price` fetch had no error guard; `.iloc[-1]` raised `IndexError` if yfinance returned empty history (network error, rate limit). Now checks `price_hist.empty` and returns `None` with a logged error instead of crashing.
+* `collect_market_snapshots.py` — removed dead imports `numpy` and `scipy.stats.norm` — math lives in `option_metrics.py`; these were leftover from when Greeks were computed here.
+* `collect_market_snapshots.py` — subprocess log calls after the collector loop used root `logging.info()` which has no handlers on the droplet. Added a named `pipeline_logger` with a configured `StreamHandler` so these lines actually appear in output.
+* `option_metrics.py` — `pd.Timestamp.now(tz="America/New_York")` was inside `iterrows()` loop — called 500+ times per chain. Moved before the loop so all rows in the same batch share the same reference time and T is consistent across contracts.
+* `2_Options_Chain.py` — term structure DTE used `Timestamp.today()` which includes the current time. At 2:30 PM, `(tomorrow_midnight - today_2:30pm).days = 0`, making next-day options show DTE=0. Fixed to `Timestamp(date_type.today())` which forces midnight.
+* `app.py` — `row.get("prev_iv")` returned `None` if column missing, `pandas.notna(None)` returned `True`, then `row["prev_iv"]` raised `KeyError`. Fixed to `"prev_iv" in row and pandas.notna(row["prev_iv"])`.
+* `app.py` — `import time` was inside the auto-refresh block at the bottom of the file. Moved to the top with other imports.
+* `3_Contract_Tracker.py` — `watchlist.json` write had no try/except. Docker volume read-only or disk full would silently lose the watchlist on restart. Wrapped in try/except with `st.warning()`.
+* `3_Contract_Tracker.py` — `if x_start and x_end` evaluated Timestamp as boolean. Replaced with `if x_start is not None and x_end is not None` for explicit intent.
+
+---
+
 ## [0.9.1] — Session 9 continued · September 2026
 
 ### Optimization — prev_iv moved from Bronze runtime scan to Gold layer
