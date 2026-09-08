@@ -8,13 +8,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import duckdb                               ## Sep 2026: read-write connection for manual H/L overrides
 import json                                ## built-in Python library for reading/writing JSON files
+import time                                ## Sep 2026: moved to top — used in write_manual_hl() retry loop
 import pandas                              ## data manipulation
 import plotly.graph_objects as go         ## plotly charts
 import streamlit as st                    ## dashboard framework
 from plotly.subplots import make_subplots ## multi-row chart layouts
 
-from utils import CATALYST_EVENTS, DARK_THEME_CSS, bull_color, bear_color, format_expiry, query, render_sidebar, render_page_header
+from utils import CATALYST_EVENTS, DARK_THEME_CSS, bull_color, bear_color, format_expiry, query, render_sidebar, render_page_header, DB_PATH  ## Sep 2026: added DB_PATH for manual H/L write connection
 
 # ── Watchlist persistence ─────────────────────────────────────────────────────
 WATCHLIST_FILE = Path(__file__).parent.parent / "watchlist.json"
@@ -40,6 +42,35 @@ def load_ohlc_override(symbol: str, date: str) -> dict:
         return df.iloc[0].to_dict()  ## {"high": 4.80, "low": 3.60}
     except Exception:
         return {}                 ## table doesn't exist yet — fall back to synthesised values
+
+def write_manual_hl(symbol: str, date: str, high: float, low: float) -> bool:
+    ## Write user-entered H/L to manual_ohlc_overrides table
+    ## Uses a short-lived read-write connection — held for milliseconds then released
+    ## Retries 3 times with 2s gap to survive the pipeline's ~30s write window at 9:35 AM / 4:15 PM
+    for attempt in range(3):                              ## 3 attempts = 6 seconds max wait
+        try:
+            con = duckdb.connect(str(DB_PATH))            ## read-write — no read_only flag
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS manual_ohlc_overrides (
+                    symbol  VARCHAR,                      -- contract symbol e.g. AAPL260918C00220000
+                    date    DATE,                         -- trading date of the override
+                    high    DOUBLE,                       -- user-entered intraday high
+                    low     DOUBLE,                       -- user-entered intraday low
+                    PRIMARY KEY (symbol, date)            -- one override row per contract per day
+                )
+            """)
+            con.execute("""
+                INSERT OR REPLACE INTO manual_ohlc_overrides VALUES (?, ?, ?, ?)
+            """, [symbol, date, high, low])               ## OR REPLACE overwrites if row already exists
+            con.close()                                   ## release write lock immediately
+            return True                                   ## success
+        except Exception:
+            try:
+                con.close()                               ## always release — even if write failed mid-way
+            except Exception:
+                pass                                      ## con may not have opened — safe to ignore
+            time.sleep(2)                                 ## wait 2s before next attempt
+    return False                                          ## all 3 attempts failed — pipeline still running
 
 def load_watchlist(ticker: str) -> list:
     ## called on page load to restore saved contracts from disk
@@ -554,6 +585,63 @@ if st.session_state["watchlist"]:
             delta_color="normal"                                    ## green = closed above open (profitable long)
         )
 
+# ── Manual H/L entry form ────────────────────────────────────────────────────
+## Only shown when a contract is pinned AND we have today's OHLC data to anchor the date
+if st.session_state["watchlist"] and ohlc_today:
+    with st.expander("✏️ Correct Today's H/L"):
+        st.caption(
+            "Pipeline captures 2 snapshots/day — 9:35 AM open and 4:15 PM close. "
+            "Enter the true intraday High and Low from your broker."
+        )
+
+        ## Pre-fill inputs with any override already saved for today
+        ## ohlc_today["high"/"low"] are None if no override exists yet
+        existing_high = ohlc_today["high"] or 0.0       ## number_input requires a float, not None
+        existing_low  = ohlc_today["low"]  or 0.0
+
+        with st.form("manual_hl_form"):                  ## st.form batches all inputs — only fires on button click, not on every keystroke
+            col_h, col_l = st.columns(2)                 ## side-by-side — compact, mirrors the card layout above
+
+            with col_h:
+                high_val = st.number_input(
+                    "Today's High ($)",
+                    min_value=0.01,                      ## options can't be zero or negative
+                    value=existing_high if existing_high > 0 else None,  ## pre-fill if already saved
+                    format="%.2f",                       ## 2 decimal places — matches option price display
+                    placeholder="e.g. 4.80",
+                )
+            with col_l:
+                low_val = st.number_input(
+                    "Today's Low ($)",
+                    min_value=0.01,
+                    value=existing_low if existing_low > 0 else None,
+                    format="%.2f",
+                    placeholder="e.g. 2.10",
+                )
+
+            submitted = st.form_submit_button("💾 Save H/L")
+
+        if submitted:
+            symbol_0  = st.session_state["watchlist"][0]  ## always saves for first pinned contract
+            today_str = ohlc_today["date"]                 ## e.g. "2026-09-08" — anchors the row to today
+
+            if high_val and low_val and high_val < low_val:   ## basic sanity check
+                st.error("High must be ≥ Low.")
+            elif high_val or low_val:                          ## at least one field filled
+                success = write_manual_hl(
+                    symbol_0, today_str,
+                    high_val or 0.0,                      ## send 0.0 if only one field filled
+                    low_val  or 0.0,
+                )
+                if success:
+                    st.success(f"Saved — High: ${high_val:.2f} · Low: ${low_val:.2f}")
+                    st.cache_data.clear()                 ## force OHLC cards to re-query with new values
+                    st.rerun()                            ## refresh page so cards update immediately
+                else:
+                    st.error("Pipeline is running — try again in a few seconds.")
+            else:
+                st.warning("Enter at least one value.")
+
 # ── Chart type + metric + timeframe ───────────────────────────────────────────
 ctrl_a, ctrl_b, ctrl_c = st.columns([2, 2, 2])
 
@@ -690,7 +778,6 @@ st.subheader("📊 OI & Volume")
 render_oi_volume(st.session_state["watchlist"][0], timeframe_days=timeframe_days)
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
-import time
 if refresh_secs:
     time.sleep(refresh_secs)
     st.rerun()

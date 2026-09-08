@@ -4,6 +4,18 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [0.9.3] — Session 9 continued · September 2026
+
+### Feature — Manual H/L override form in Contract Tracker
+
+* `3_Contract_Tracker.py` — added `write_manual_hl()` with 3-attempt retry loop (`time.sleep(2)` between attempts). Pipeline holds DuckDB write lock for ~30s at 9:35 AM and 4:15 PM EST; retrying up to 6 seconds covers the lock window without surfacing errors to the user in normal conditions.
+* `3_Contract_Tracker.py` — added `manual_ohlc_overrides` DuckDB table (`CREATE TABLE IF NOT EXISTS`) created on first form submit. Schema: `symbol VARCHAR, date DATE, high DOUBLE, low DOUBLE, PRIMARY KEY (symbol, date)`. `INSERT OR REPLACE` overwrites if user corrects a value already saved today.
+* `3_Contract_Tracker.py` — added `✏️ Correct Today's H/L` expander below OHLC cards. Inputs pre-fill with any override already saved for today. Validates `high >= low` before writing. On success: clears `st.cache_data` and reruns so cards update immediately.
+* `3_Contract_Tracker.py` — `import duckdb` and `import time` moved to top of file. `DB_PATH` added to utils import. Duplicate `import time` at bottom of file removed.
+* Architecture note: uses a separate short-lived read-write connection for the form write while the rest of the dashboard stays on the existing `read_only=True` connection. Write lock held for milliseconds only.
+
+---
+
 ## [0.9.2] — Session 9 continued · September 2026
 
 ### Bug fixes — full file scan (11 issues)
