@@ -671,8 +671,8 @@ if st.session_state["watchlist"] and ohlc_today:
 
         ## Pre-fill inputs with any override already saved for today
         ## ohlc_today["high"/"low"] are None if no override exists yet
-        existing_high = ohlc_today["high"] or 0.0       ## number_input requires a float, not None
-        existing_low  = ohlc_today["low"]  or 0.0
+        existing_high = float(ohlc_today["high"]) if ohlc_today["high"] is not None else 0.0  ## cast numpy float32 → Python float — Streamlit requires all numeric args same type
+        existing_low  = float(ohlc_today["low"])  if ohlc_today["low"]  is not None else 0.0
 
         with st.form("manual_hl_form"):                  ## st.form batches all inputs — only fires on button click, not on every keystroke
             col_h, col_l = st.columns(2)                 ## side-by-side — compact, mirrors the card layout above
