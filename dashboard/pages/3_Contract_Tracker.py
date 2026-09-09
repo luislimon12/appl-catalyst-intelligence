@@ -185,6 +185,10 @@ def get_contract_history(symbol, metric_col="lastPrice"):
         -- Only keep snapshots between 9 AM and 6 PM
         AND HOUR(snapshot_time) BETWEEN 9 AND 23
 
+        -- Sep 2026: exclude pre-market garbage snapshots from Mac LaunchAgent era
+        -- Hours 9-12 UTC = 5-8 AM EST — market closed, IV near zero, corrupts chart
+        AND impliedVolatility > 0.05
+
         -- Jun 25 2026: injected dynamically based on metric_col
         -- Empty string for Price (show all snapshots)
         -- Correlated subquery for IV/Delta (one point per day, latest only)
@@ -875,7 +879,7 @@ else:
             ts = pandas.to_datetime(df["snapshot_time"])
             if x_start is None:               ## first panel with data — initialize bounds
                 x_start = ts.min()
-                x_end   = ts.max() + pandas.Timedelta(days=30)
+                x_end   = ts.max() + pandas.Timedelta(days=5)   ## Sep 2026: reduced from 30 to 5 — 30 days of empty space compressed all data into left third of chart
             else:                             ## subsequent panels — expand if data goes further
                 x_start = min(x_start, ts.min())
                 x_end   = max(x_end, ts.max() + pandas.Timedelta(days=30))
