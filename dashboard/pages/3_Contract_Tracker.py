@@ -213,6 +213,55 @@ def get_contract_highlow(symbol: str) -> dict:
         return {"contract_high": None, "contract_low": None}
     return df.iloc[0].to_dict()              ## return as dict e.g. {"contract_high": 8.20, "contract_low": 0.50}
 
+@st.cache_data(ttl=60)  ## cache 60s — history only changes when pipeline runs or user saves H/L
+def get_ohlc_history(symbol: str) -> pandas.DataFrame:
+    ## Build full OHLC history for this contract across all trading days
+    ## Open/Close from Bronze AM/PM snapshots — H/L from manual_ohlc_overrides
+    ## Overnight gap and session return computed via LAG() on prev day's close
+    ## symbol passed twice — once for the WHERE filter, once for the LEFT JOIN condition
+    return query(
+        """
+        WITH daily AS (
+            -- Step 1: collapse 2 Bronze rows per day into 1 row with open + close columns
+            SELECT
+                DATE(snapshot_time)                              AS date,
+                MAX(CASE WHEN HOUR(snapshot_time) < 17
+                    THEN lastPrice END)                          AS open,   -- 9:35 AM EST = hour 13 UTC
+                MAX(CASE WHEN HOUR(snapshot_time) >= 17
+                    THEN lastPrice END)                          AS close   -- 4:15 PM EST = hour 21 UTC
+            FROM bronze_options_raw
+            WHERE contractSymbol = ?
+              AND lastPrice > 0
+              AND impliedVolatility > 0.01
+              AND HOUR(snapshot_time) BETWEEN 9 AND 23
+            GROUP BY DATE(snapshot_time)
+        ),
+        with_prev AS (
+            -- Step 2: add prev_close by looking at the previous row's close via LAG()
+            SELECT
+                date,
+                open,
+                close,
+                LAG(close) OVER (ORDER BY date)                  AS prev_close
+            FROM daily
+        )
+        -- Step 3: attach manual H/L and compute overnight gap + session return
+        SELECT
+            w.date                                               AS Date,
+            w.prev_close                                         AS "Prev Close",
+            w.open                                               AS Open,
+            m.high                                               AS High,
+            m.low                                                AS Low,
+            w.close                                              AS Close,
+            w.open  - w.prev_close                              AS "Overnight Gap",
+            w.close - w.prev_close                              AS "Session Return"
+        FROM with_prev w
+        LEFT JOIN manual_ohlc_overrides m                        -- LEFT JOIN keeps days with no manual H/L
+            ON m.symbol = ? AND m.date = w.date
+        ORDER BY w.date DESC                                     -- most recent day first
+        """, [symbol, symbol]
+    )
+
 @st.cache_data(ttl=60)  ## cache 60s — prev close only changes when pipeline runs (9:35 AM / 4:15 PM)
 def get_prev_close(symbol: str) -> float | None:
     ## Fetch yesterday's 4:15 PM snapshot price — the market's last settled price before today
@@ -719,6 +768,27 @@ if st.session_state["watchlist"] and ohlc_today:
                     st.error(f"Write failed: {err}")      ## show real DuckDB error for diagnosis
             else:
                 st.warning("Enter at least one value.")
+
+# ── OHLC History table ───────────────────────────────────────────────────────
+if st.session_state["watchlist"]:
+    symbol_0 = st.session_state["watchlist"][0]   ## first pinned contract
+    history  = get_ohlc_history(symbol_0)          ## fetch full history
+    if not history.empty:
+        st.subheader("📋 OHLC History")
+        st.caption(f"{symbol_0} · Open/Close from snapshots · H/L from manual entry · most recent first")
+        st.dataframe(
+            history.style.format({
+                "Prev Close":     lambda x: f"${x:.2f}" if pandas.notna(x) else "—",
+                "Open":           lambda x: f"${x:.2f}" if pandas.notna(x) else "—",
+                "High":           lambda x: f"${x:.2f}" if pandas.notna(x) else "—",
+                "Low":            lambda x: f"${x:.2f}" if pandas.notna(x) else "—",
+                "Close":          lambda x: f"${x:.2f}" if pandas.notna(x) else "—",
+                "Overnight Gap":  lambda x: f"{x:+.2f}" if pandas.notna(x) else "—",
+                "Session Return": lambda x: f"{x:+.2f}" if pandas.notna(x) else "—",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 # ── Chart type + metric + timeframe ───────────────────────────────────────────
 ctrl_a, ctrl_b, ctrl_c = st.columns([2, 2, 2])
