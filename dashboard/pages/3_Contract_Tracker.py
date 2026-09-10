@@ -217,6 +217,24 @@ def get_contract_highlow(symbol: str) -> dict:
         return {"contract_high": None, "contract_low": None}
     return df.iloc[0].to_dict()              ## return as dict e.g. {"contract_high": 8.20, "contract_low": 0.50}
 
+@st.cache_data(ttl=60)
+def get_iv_band(symbol: str) -> pandas.DataFrame:
+    ## Returns one row per trading day with AM and PM implied volatility
+    ## am_iv = 9:35 snapshot (HOUR < 17 UTC), pm_iv = 4:15 snapshot (HOUR >= 17 UTC)
+    ## Band = range between am_iv and pm_iv — shows whether IV expanded or crushed during session
+    ## impliedVolatility > 0.05 floor removes garbage pre-market prints
+    return query("""
+        SELECT
+            DATE(snapshot_time)                                                  AS date,
+            MAX(CASE WHEN HOUR(snapshot_time) < 17 THEN impliedVolatility END)  AS iv_am,
+            MAX(CASE WHEN HOUR(snapshot_time) >= 17 THEN impliedVolatility END) AS iv_pm
+        FROM bronze_options_raw
+        WHERE contractSymbol = ?
+          AND impliedVolatility > 0.05
+        GROUP BY DATE(snapshot_time)
+        ORDER BY date
+    """, [symbol])
+
 @st.cache_data(ttl=60)  ## cache 60s — history only changes when pipeline runs or user saves H/L
 def get_ohlc_history(symbol: str) -> pandas.DataFrame:
     ## Build full OHLC history for this contract across all trading days
@@ -635,13 +653,28 @@ if st.session_state["watchlist"]:
 
     st.divider()                                                       ## visual separator before chart controls
 
+# ── Active contract selector ──────────────────────────────────────────────────
+## Sep 2026: when multiple contracts are pinned, show a switcher so each is viewed individually
+## All sections below (OHLC cards, H/L form, OHLC history, charts) read from active_contract
+## Single-contract watchlist skips the radio — no visual noise for the common case
+if st.session_state["watchlist"]:
+    if len(st.session_state["watchlist"]) > 1:
+        active_contract = st.radio(
+            "Viewing contract",
+            st.session_state["watchlist"],
+            horizontal=True,
+            key="active_contract",
+        )
+    else:
+        active_contract = st.session_state["watchlist"][0]  ## single contract — no selector needed
+
 # ── Today's OHLC metric cards ─────────────────────────────────────────────────
 ## Sep 2026: 5-card layout — Prev Close as primary reference anchor
 ## Prev Close = yesterday's PM snapshot — baseline for overnight gap and session return
 ## High/Low = manual entry only (from ✏️ form below) — show "—" until user enters them
 if st.session_state["watchlist"]:
-    ohlc_today = get_today_ohlc(st.session_state["watchlist"][0])  ## pull OHLC for first pinned contract
-    prev_close = get_prev_close(st.session_state["watchlist"][0])  ## yesterday's PM snapshot price — our reference anchor
+    ohlc_today = get_today_ohlc(active_contract)  ## pull OHLC for selected contract
+    prev_close = get_prev_close(active_contract)  ## yesterday's PM snapshot price — our reference anchor
     if ohlc_today:
         st.caption(
             f"📅 {ohlc_today['date']} · Open = 9:35 AM snapshot · Close = 4:15 PM snapshot"
@@ -753,7 +786,7 @@ if st.session_state["watchlist"] and ohlc_today:
             submitted = st.form_submit_button("💾 Save H/L")
 
         if submitted:
-            symbol_0  = st.session_state["watchlist"][0]  ## always saves for first pinned contract
+            symbol_0  = active_contract  ## Sep 2026: saves for the currently selected contract
             today_str = ohlc_today["date"]                 ## e.g. "2026-09-08" — anchors the row to today
 
             if high_val and low_val and high_val < low_val:   ## basic sanity check
@@ -775,7 +808,7 @@ if st.session_state["watchlist"] and ohlc_today:
 
 # ── OHLC History table ───────────────────────────────────────────────────────
 if st.session_state["watchlist"]:
-    symbol_0 = st.session_state["watchlist"][0]   ## first pinned contract
+    symbol_0 = active_contract                      ## Sep 2026: selected contract
     history  = get_ohlc_history(symbol_0)          ## fetch full history
     if not history.empty:
         st.subheader("📋 OHLC History")
@@ -829,9 +862,7 @@ if not st.session_state["watchlist"]:
     st.stop()
 
 if chart_type == "Candlestick":
-    if len(st.session_state["watchlist"]) > 1:
-        st.warning("Candlestick shows one contract at a time. Displaying first pinned contract.")
-    render_candlestick(st.session_state["watchlist"][0], timeframe_days=timeframe_days)
+    render_candlestick(active_contract, timeframe_days=timeframe_days)  ## Sep 2026: uses selected contract — warning removed, selector above handles switching
 else:
     ## Aug 2026: replaced single chart + overlay radio with 2×2 small multiples grid
     ## Each panel shows one metric — Price, IV, Delta, Theta — all step charts
@@ -849,17 +880,19 @@ else:
     ## col_name: DB column to fetch | mult: multiplier (IV ×100 converts 0.27 → 27%) | fmt: hover decimal format
     panels = [
         {"row": 1, "col": 1, "col_name": "lastPrice",        "label": "Price", "unit": "$",  "mult": 1,   "fmt": ".2f"},
-        {"row": 1, "col": 2, "col_name": "impliedVolatility", "label": "IV",    "unit": "%",  "mult": 100, "fmt": ".1f"},
-        {"row": 2, "col": 1, "col_name": "delta",             "label": "Delta", "unit": "",   "mult": 1,   "fmt": ".4f"},
+        {"row": 1, "col": 2, "col_name": "impliedVolatility", "label": "IV",    "unit": "%",  "mult": 100, "fmt": ".1f", "band": True},  ## Sep 2026: flagged for band rendering — skipped in scatter loop
+        {"row": 2, "col": 1, "col_name": "delta",             "label": "Delta", "unit": "",   "mult": 1,   "fmt": ".4f", "bar": True},  ## Sep 2026: flagged for bar rendering — skipped in scatter loop below
         {"row": 2, "col": 2, "col_name": "theta",             "label": "Theta", "unit": "",   "mult": 1,   "fmt": ".4f"},
     ]
 
     x_start, x_end = None, None  ## track x-axis bounds across all panels — filled during loop
 
-    for i, symbol in enumerate(st.session_state["watchlist"]):
+    for i, symbol in enumerate([active_contract]):  ## Sep 2026: show selected contract only — use selector above to switch
         color = colors[i % len(colors)]  ## cycle through colors for each contract
 
         for panel in panels:
+            if panel.get("bar") or panel.get("band"):  ## Sep 2026: bar/band panels rendered in separate passes below — skip in scatter loop
+                continue
             df = get_contract_history(symbol, metric_col=panel["col_name"])  ## dedup logic inside get_contract_history
             if df.empty:                                                       ## no data for this contract+metric
                 continue
@@ -898,6 +931,86 @@ else:
                 hovertemplate=f"{panel['label']}: %{{y:{panel['fmt']}}}{panel['unit']}<extra>{symbol}</extra>",
             ), row=panel["row"], col=panel["col"])  ## place trace in correct grid cell
 
+        ## Sep 2026: second pass — render bar-flagged panels (Delta)
+        ## Bar chart makes zero-crossings legible — step line looked flat and ambiguous
+        ## Green bars = positive delta (call-dominant / bullish)
+        ## Red bars  = negative delta (put-dominant / bearish)
+        ## Respects colorblind mode via bull_color() / bear_color()
+        for panel in panels:
+            if not panel.get("bar"):          ## only process bar-flagged panels here
+                continue
+            df_b = get_contract_history(symbol, metric_col=panel["col_name"])
+            if df_b.empty:
+                continue
+            df_b = df_b.dropna(subset=[panel["col_name"]])  ## drop NULLs — Greeks not always present
+            if timeframe_days is not None:
+                cutoff = pandas.to_datetime(df_b["snapshot_time"]).max() - pandas.Timedelta(days=timeframe_days)
+                df_b   = df_b[pandas.to_datetime(df_b["snapshot_time"]) >= cutoff]
+            if df_b.empty:
+                continue
+
+            ## Color each bar individually — green/bull above zero, red/bear below
+            bar_colors = [
+                bull_color() if v >= 0 else bear_color()
+                for v in df_b[panel["col_name"]]
+            ]
+
+            fig.add_trace(go.Bar(
+                x=df_b["snapshot_time"],                          ## x = snapshot timestamp
+                y=df_b[panel["col_name"]],                        ## y = raw delta (no multiplier needed)
+                name=symbol,                                       ## matches legend entries from scatter
+                marker_color=bar_colors,                           ## individual bar color (green/red)
+                showlegend=False,                                  ## Price scatter already added this symbol to legend
+                hovertemplate=f"Delta: %{{y:.4f}}<extra>{symbol}</extra>",
+            ), row=panel["row"], col=panel["col"])
+
+        ## Sep 2026: third pass — render band-flagged panels (IV)
+        ## Three traces per contract: invisible lower, shaded upper, visible PM close line
+        ## Band width = intraday IV range — wide = IV expanded, narrow = IV stable
+        for panel in panels:
+            if not panel.get("band"):             ## only process band-flagged panels here
+                continue
+            df_iv = get_iv_band(symbol)           ## daily AM/PM IV — one row per trading day
+            if df_iv.empty:
+                continue
+            if timeframe_days is not None:
+                cutoff = pandas.to_datetime(df_iv["date"]).max() - pandas.Timedelta(days=timeframe_days)
+                df_iv  = df_iv[pandas.to_datetime(df_iv["date"]) >= cutoff]
+            df_iv = df_iv.dropna(subset=["iv_am", "iv_pm"])  ## skip days with only one snapshot — can't draw band
+            if df_iv.empty:
+                continue
+
+            iv_lower = df_iv[["iv_am", "iv_pm"]].min(axis=1) * 100  ## lower band edge (%)
+            iv_upper = df_iv[["iv_am", "iv_pm"]].max(axis=1) * 100  ## upper band edge (%)
+            iv_close = df_iv["iv_pm"] * 100                          ## PM close IV — main line
+
+            ## Trace 1: invisible lower bound — anchors the fill at the bottom
+            fig.add_trace(go.Scatter(
+                x=df_iv["date"], y=iv_lower,
+                mode="lines", line=dict(width=0),
+                showlegend=False, hoverinfo="skip",
+            ), row=panel["row"], col=panel["col"])
+
+            ## Trace 2: invisible upper bound — fills down to trace 1 (tonexty)
+            fig.add_trace(go.Scatter(
+                x=df_iv["date"], y=iv_upper,
+                mode="lines", line=dict(width=0),
+                fill="tonexty",
+                fillcolor="rgba(188,140,255,0.20)",  ## soft purple — IV is a vol metric, not directional
+                showlegend=False, hoverinfo="skip",
+            ), row=panel["row"], col=panel["col"])
+
+            ## Trace 3: PM close IV — solid line with markers, the actual trend to read
+            fig.add_trace(go.Scatter(
+                x=df_iv["date"], y=iv_close,
+                name=symbol,
+                mode="lines+markers",
+                line=dict(color=color, width=2),
+                marker=dict(size=6),
+                showlegend=False,                    ## legend already set by Price scatter
+                hovertemplate="IV: %{y:.1f}%<extra>" + symbol + "</extra>",
+            ), row=panel["row"], col=panel["col"])
+
         ## Catalyst vlines — draw on all 4 panels so events are visible in every metric
         for event_name, event_date in CATALYST_EVENTS.items():
             for panel in panels:
@@ -927,7 +1040,7 @@ else:
 ## Jun 18 2026: added to track positioning signals around catalyst events
 st.divider()
 st.subheader("📊 OI & Volume")
-render_oi_volume(st.session_state["watchlist"][0], timeframe_days=timeframe_days)
+render_oi_volume(active_contract, timeframe_days=timeframe_days)  ## Sep 2026: uses selected contract
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 if refresh_secs:
