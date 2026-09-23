@@ -11,43 +11,18 @@ import os
 import sys
 import subprocess
 import logging
-import zoneinfo                          ## Sep 2026: stdlib (Python 3.9+) — used for EST timezone in is_market_open()
-from datetime import datetime, date
+from datetime import datetime             ## snapshot_time uses datetime.now()
 
 import pandas as pd
 import yfinance as yf  ## Sep 2026: removed unused numpy and scipy.stats imports — math lives in option_metrics.py
 
 from price_metrics import clean_price, calculate_hv
 from option_metrics import calculate_greeks
-
-## US market holidays — extend annually each December
-MARKET_HOLIDAYS = {
-    ## 2026
-    date(2026, 1, 1),   ## New Year's Day
-    date(2026, 1, 19),  ## MLK Day
-    date(2026, 2, 16),  ## Presidents Day
-    date(2026, 4, 3),   ## Good Friday
-    date(2026, 5, 25),  ## Memorial Day
-    date(2026, 7, 3),   ## Independence Day (observed)
-    date(2026, 9, 7),   ## Labor Day
-    date(2026, 11, 26), ## Thanksgiving
-    date(2026, 11, 27), ## Day after Thanksgiving (early close — skip for safety)
-    date(2026, 12, 25), ## Christmas
-    ## 2027 — Sep 2026: added to prevent snapshots on market-closed days
-    date(2027, 1, 1),   ## New Year's Day
-    date(2027, 1, 18),  ## MLK Day
-    date(2027, 2, 15),  ## Presidents Day
-    date(2027, 3, 26),  ## Good Friday
-    date(2027, 5, 31),  ## Memorial Day
-    date(2027, 7, 5),   ## Independence Day (observed, July 4 falls on Sunday)
-    date(2027, 9, 6),   ## Labor Day
-    date(2027, 11, 25), ## Thanksgiving
-    date(2027, 11, 26), ## Day after Thanksgiving (early close — skip for safety)
-    date(2027, 12, 24), ## Christmas (observed, Dec 25 falls on Saturday)
-}
-
-## Tickers to collect — add or remove here
-TICKERS = ["AAPL", "INTC"]
+from pipeline_utils import (
+    TICKERS, MARKET_HOLIDAYS, is_market_open,       ## Sep 2026: moved to pipeline_utils — shared with collect_chain_snapshot.py
+    setup_logger, add_metadata,                      ## logger + metadata tagging helpers
+    fetch_spot_price, fetch_risk_free_rate           ## market data helpers
+)
 
 
 class MarketSnapshotCollector:
@@ -73,25 +48,13 @@ class MarketSnapshotCollector:
         os.makedirs(self.price_dir,   exist_ok=True)
         os.makedirs(self.options_dir, exist_ok=True)
 
-        self.logger = logging.getLogger(self.__class__.__name__)
-        if not self.logger.handlers:
-            handler   = logging.StreamHandler()
-            formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+        self.logger = setup_logger(self.__class__.__name__)  ## Sep 2026: moved to pipeline_utils — was 5 lines of boilerplate inline
 
         self.asset = yf.Ticker(self.ticker)
 
     # ── HELPERS ───────────────────────────────────────────────────────────────
 
-    def add_metadata(self, df: pd.DataFrame) -> pd.DataFrame:
-        ## Tag every row with snapshot timestamp and ticker for downstream joins
-        df = df.copy()
-        df["snapshot_time"] = self.snapshot_time
-        df["snapshot_str"]  = self.snapshot_str
-        df["ticker"]        = self.ticker
-        return df
+    ## Sep 2026: add_metadata() moved to pipeline_utils — import at top of file
 
     def save_dataframe(self, df: pd.DataFrame, path: str) -> None:
         ## Save DataFrame to CSV; log success or failure with shape
@@ -114,7 +77,7 @@ class MarketSnapshotCollector:
             prices = prices.reset_index()
             prices = calculate_hv(prices)
             prices = clean_price(prices)
-            prices = self.add_metadata(prices)
+            prices = add_metadata(prices, self.snapshot_time, self.ticker)  ## Sep 2026: standalone function — pass snapshot_time and ticker explicitly
 
             path = f"{self.price_dir}/{self.ticker.lower()}_price_{self.snapshot_str}.csv"
             self.save_dataframe(prices, path)
@@ -138,25 +101,11 @@ class MarketSnapshotCollector:
 
         self.logger.info(f"Fetching {len(expiries)} expiries for {self.ticker}")
 
-        ## Sep 2026: guard against empty history — yfinance can return empty DataFrame on network errors,
-        ## rate limits, or holidays. Without this check, .iloc[-1] raises IndexError and silently drops
-        ## the entire options collection for this run.
-        price_hist = self.asset.history(period="1d")
-        if price_hist.empty:
-            self.logger.error("Could not fetch spot price — yfinance returned empty history. Skipping options collection.")
+        spot_price = fetch_spot_price(self.asset, self.logger)  ## Sep 2026: moved to pipeline_utils
+        if spot_price is None:                                   ## None = fetch failed — abort options collection
             return None
-        spot_price = price_hist["Close"].iloc[-1]
-        self.logger.info(f"Spot price: {spot_price:.2f}")
 
-        ## Sep 2026: fetch live 13-week T-bill rate — ^IRX returns annualized % (e.g. 4.25 = 4.25%)
-        ## fallback to 0.043 if fetch fails (current approximate rate as of Sep 2026)
-        try:
-            irx = yf.Ticker("^IRX").fast_info["last_price"]   ## annualized yield in percent
-            r   = irx / 100                                    ## convert to decimal (4.25 → 0.0425)
-            self.logger.info(f"Risk-free rate: {r:.4f} (from ^IRX)")
-        except Exception:
-            r   = 0.043                                        ## fallback if ^IRX unavailable
-            self.logger.warning("^IRX fetch failed — using fallback r=0.043")
+        r = fetch_risk_free_rate(self.logger)  ## Sep 2026: moved to pipeline_utils
 
         options_list = []
 
@@ -179,7 +128,7 @@ class MarketSnapshotCollector:
                     r=r,                        ## Sep 2026: live T-bill rate instead of hardcoded 0.05
                     logger=self.logger          ## pass logger so Greeks failures appear in log
                 )
-                combined = self.add_metadata(combined)
+                combined = add_metadata(combined, self.snapshot_time, self.ticker)  ## Sep 2026: standalone function — pass snapshot_time and ticker explicitly
                 options_list.append(combined)
 
                 self.logger.info(f"Collected expiry {expiry} | rows={combined.shape[0]}")
@@ -210,21 +159,11 @@ class MarketSnapshotCollector:
         self.save_dataframe(options_df, path)
         return options_df
 
-    def is_market_open(self) -> bool:
-        ## Returns True on weekdays that are not US market holidays
-        ## Sep 2026: use America/New_York explicitly — droplet runs UTC so datetime.now() returns UTC
-        ## zoneinfo is stdlib (Python 3.9+) — no extra install needed
-        now   = datetime.now(tz=zoneinfo.ZoneInfo("America/New_York"))
-        today = now.date()                  ## EST/EDT date — correct for holiday and weekend checks
-        if today in MARKET_HOLIDAYS:
-            return False
-        return now.weekday() < 5            ## 0=Mon … 4=Fri, 5=Sat, 6=Sun
-
     # ── ORCHESTRATOR ──────────────────────────────────────────────────────────
 
     def run(self) -> None:
         ## Entry point — check market, then collect price and options in sequence
-        if not self.is_market_open():
+        if not is_market_open():  ## Sep 2026: now a standalone function in pipeline_utils
             self.logger.info("Market closed. Skipping snapshot run.")
             return
 
@@ -235,15 +174,7 @@ class MarketSnapshotCollector:
 
 
 if __name__ == "__main__":
-    ## Sep 2026: module-level logger for the orchestrator block — root logger has no handlers
-    ## configured so logging.info() produced no output on the droplet; named logger inherits
-    ## the handler set up inside MarketSnapshotCollector.__init__() via the root handler chain
-    pipeline_logger = logging.getLogger("pipeline")
-    handler   = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s | %(name)s | %(levelname)s | %(message)s")
-    handler.setFormatter(formatter)
-    pipeline_logger.addHandler(handler)
-    pipeline_logger.setLevel(logging.INFO)
+    pipeline_logger = setup_logger("pipeline")  ## Sep 2026: moved to pipeline_utils — was 5 lines of boilerplate inline
 
     for ticker in TICKERS:
         collector = MarketSnapshotCollector(ticker=ticker)
