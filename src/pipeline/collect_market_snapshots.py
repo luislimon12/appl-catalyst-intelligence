@@ -144,9 +144,14 @@ class MarketSnapshotCollector:
         options_list = [df for df in options_list if not df.empty]  ## drop empty/all-NA frames before concat — suppresses FutureWarning
         options_df = pd.concat(options_list, ignore_index=True)
 
+        ## Sep 2026: compute bid/ask midpoint — more reliable than lastPrice for open/close
+        ## lastPrice only updates on a trade; mid updates every few seconds from market makers
+        ## OTM options can go 30-60 min without a trade, so lastPrice is often stale at open
+        options_df["mid"] = (options_df["bid"] + options_df["ask"]) / 2  ## midpoint in dollars
+
         keep_cols = [
             "contractSymbol", "expiry", "option_type", "strike",
-            "bid", "ask", "lastPrice", "volume", "openInterest",
+            "bid", "ask", "mid", "lastPrice", "volume", "openInterest",  ## mid inserted after ask — derived from bid/ask
             "impliedVolatility", "delta", "gamma", "theta", "vega",
             "inTheMoney", "snapshot_time", "snapshot_str", "ticker"
         ]

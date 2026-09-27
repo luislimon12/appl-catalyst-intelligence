@@ -47,6 +47,7 @@ class DatabaseBuilder:
             strike FLOAT,
             bid FLOAT,
             ask FLOAT,
+            mid FLOAT,         -- Sep 2026: bid/ask midpoint — reliable price when no trade has occurred
             lastPrice FLOAT,
             volume INTEGER,
             openInterest INTEGER,
@@ -150,7 +151,9 @@ class DatabaseBuilder:
                 INSERT INTO bronze_options_raw
                 SELECT
                     contractSymbol, expiry, option_type, strike,
-                    bid, ask, lastPrice, volume, openInterest,
+                    bid, ask,
+                    TRY_CAST(mid AS FLOAT),   -- Sep 2026: NULL-safe cast — old CSVs without mid column return NULL instead of crashing
+                    lastPrice, volume, openInterest,
                     impliedVolatility, delta, gamma, theta, vega,
                     -- inTheMoney arrives as 'True'/'False' OR '1.0'/'0.0' depending on pandas version
                     -- types={{'inTheMoney':'VARCHAR'}} forces DuckDB to read it as a string first

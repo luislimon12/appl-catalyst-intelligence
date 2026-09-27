@@ -4,6 +4,54 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [1.0.0] — Session 10 · September 2026
+
+### Bug fix — stale Open / Prev Close prices (bid/ask midpoint)
+
+Root cause: `lastPrice` only updates when a trade occurs. OTM options can go 30–60 minutes without a trade, so the 9:50 AM snapshot captures a stale `lastPrice` from the prior session. The Open card was showing yesterday's closing price instead of today's open.
+
+* `collect_market_snapshots.py` — added `options_df["mid"] = (options_df["bid"] + options_df["ask"]) / 2` after chain concat. `mid` is a continuous bid/ask midpoint updated every few seconds by market makers regardless of whether a trade occurs. Added `"mid"` to `keep_cols` so it is saved to every CSV going forward.
+* `build_database.py` — added `mid FLOAT` column to `bronze_options_raw` schema. INSERT uses `TRY_CAST(mid AS FLOAT)` — NULL-safe cast so old CSVs without a `mid` column return NULL instead of crashing.
+* `3_Contract_Tracker.py` → `get_ohlc_data()` — switched open and close from `lastPrice` to `mid` with `lastPrice` fallback (`df["mid"].where(notna & > 0, other=df["lastPrice"])`). WHERE loosened from `lastPrice > 0` to `mid > 0 OR lastPrice > 0` to accept both old and new rows.
+* `3_Contract_Tracker.py` → `get_prev_close()` — same `mid` preference: selects both `mid` and `lastPrice`, returns `mid` when valid, else `lastPrice`. WHERE updated to match.
+* `3_Contract_Tracker.py` → `get_ohlc_history()` — SQL CTE Step 1 pivot updated to `COALESCE(NULLIF(mid, 0), lastPrice)` inside each `CASE WHEN HOUR` branch. `NULLIF(mid, 0)` converts a zero `mid` to NULL so COALESCE falls through to `lastPrice`. Old rows without a `mid` column also fall through naturally.
+
+**Droplet migration required before deploy:**
+```sql
+ALTER TABLE bronze_options_raw ADD COLUMN IF NOT EXISTS mid FLOAT;
+```
+
+### Feature — pipeline shared utilities (`pipeline_utils.py`)
+
+* `src/pipeline/pipeline_utils.py` — new shared module. Extracted duplicated code from `collect_market_snapshots.py` to avoid repeating it in the upcoming `collect_chain_snapshot.py`:
+  * `TICKERS` — list of tracked underlyings
+  * `MARKET_HOLIDAYS` — US NYSE holidays for 2026 and 2027
+  * `is_market_open()` — timezone-safe weekday + holiday check (America/New_York)
+  * `setup_logger(name)` — consistent log format across all pipeline scripts
+  * `add_metadata(df, snapshot_time, ticker)` — tags every DataFrame with timestamp and ticker
+  * `fetch_spot_price(asset, logger)` — yfinance spot price with error handling
+  * `fetch_risk_free_rate(logger)` — live ^IRX T-bill rate with 4.3% fallback
+* `collect_market_snapshots.py` — removed all extracted code; imports from `pipeline_utils` instead.
+
+### Feature — contract switcher (multi-contract watchlist)
+
+* `3_Contract_Tracker.py` — added `st.radio("Viewing contract", watchlist, horizontal=True)` above the OHLC cards. When the watchlist has more than one contract, a horizontal radio switcher lets you view each one individually. All downstream queries (OHLC, Greeks, charts, OI/Volume) use `active_contract` instead of the hardcoded `watchlist[0]`.
+
+### Feature — Delta bar chart
+
+* `3_Contract_Tracker.py` — Delta panel in the 2×2 grid now renders as a bar chart with per-bar coloring: green for positive delta (≥ 0), red for negative. Uses `go.Bar` with `marker_color` list. Delta panel flagged with `"bar": True` in the panels dict; bar panels are skipped in the scatter pass and rendered in a second pass.
+
+### Feature — IV band chart (AM/PM shaded range)
+
+* `3_Contract_Tracker.py` — IV panel in the 2×2 grid now renders as a shaded band showing the intraday IV range (AM vs PM). Three-trace approach: invisible lower bound → filled upper bound (`fill="tonexty"`, purple 20% opacity) → visible PM close line. AM/PM split uses `HOUR(snapshot_time) < 17` (UTC) consistent with OHLC filters.
+* `3_Contract_Tracker.py` — added `get_iv_band(symbol)` — SQL groups by date with `MAX(CASE WHEN HOUR < 17 ...)` for AM IV and `MAX(CASE WHEN HOUR >= 17 ...)` for PM IV. IV panel flagged with `"band": True` in the panels dict; rendered in a third pass after scatter and bar passes.
+
+### Pipeline — snapshot timing updated
+
+* Droplet crontab updated: AM snapshot moved from 9:35 AM → 9:50 AM EDT (`50 13 * * 1-5`). PM snapshot moved from 4:15 PM → 4:00 PM EDT (`0 20 * * 1-5`). 9:50 AM gives 15 minutes for market makers to set tight bid/ask spreads and for mid to stabilise. 4:00 PM captures the final price before market close rather than after.
+
+---
+
 ## [0.9.5] — Session 9 continued · September 2026
 
 ### Bug fixes — manual H/L form and OHLC cards (5 issues)

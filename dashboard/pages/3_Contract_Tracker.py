@@ -239,21 +239,25 @@ def get_iv_band(symbol: str) -> pandas.DataFrame:
 def get_ohlc_history(symbol: str) -> pandas.DataFrame:
     ## Build full OHLC history for this contract across all trading days
     ## Open/Close from Bronze AM/PM snapshots — H/L from manual_ohlc_overrides
+    ## Sep 2026: uses COALESCE(mid, lastPrice) — mid is preferred (continuous), lastPrice is fallback
     ## Overnight gap and session return computed via LAG() on prev day's close
     ## symbol passed twice — once for the WHERE filter, once for the LEFT JOIN condition
     return query(
         """
         WITH daily AS (
             -- Step 1: collapse 2 Bronze rows per day into 1 row with open + close columns
+            -- COALESCE(NULLIF(mid, 0), lastPrice): use bid/ask midpoint when available and non-zero;
+            -- NULLIF(mid, 0) converts a zero mid to NULL so COALESCE falls through to lastPrice
+            -- old CSVs without a mid column return NULL, which also falls through to lastPrice
             SELECT
-                DATE(snapshot_time)                              AS date,
+                DATE(snapshot_time)                                          AS date,
                 MAX(CASE WHEN HOUR(snapshot_time) < 17
-                    THEN lastPrice END)                          AS open,   -- 9:35 AM EST = hour 13 UTC
+                    THEN COALESCE(NULLIF(mid, 0), lastPrice) END)           AS open,   -- AM snapshot (9:50 AM EDT = ~13 UTC)
                 MAX(CASE WHEN HOUR(snapshot_time) >= 17
-                    THEN lastPrice END)                          AS close   -- 4:15 PM EST = hour 21 UTC
+                    THEN COALESCE(NULLIF(mid, 0), lastPrice) END)           AS close   -- PM snapshot (4:00 PM EDT = ~20 UTC)
             FROM bronze_options_raw
             WHERE contractSymbol = ?
-              AND lastPrice > 0
+              AND (mid > 0 OR lastPrice > 0)                                -- Sep 2026: accept either price — old CSVs lack mid
               AND impliedVolatility > 0.01
               AND HOUR(snapshot_time) BETWEEN 9 AND 23
             GROUP BY DATE(snapshot_time)
@@ -284,27 +288,31 @@ def get_ohlc_history(symbol: str) -> pandas.DataFrame:
         """, [symbol, symbol]
     )
 
-@st.cache_data(ttl=60)  ## cache 60s — prev close only changes when pipeline runs (9:35 AM / 4:15 PM)
+@st.cache_data(ttl=60)  ## cache 60s — prev close only changes when pipeline runs (9:50 AM / 4:00 PM)
 def get_prev_close(symbol: str) -> float | None:
-    ## Fetch yesterday's 4:15 PM snapshot price — the market's last settled price before today
-    ## This is the reference anchor for overnight gap (Open − Prev Close) and session return (Close − Prev Close)
-    ## "Yesterday" = the most recent trading day before today — skips weekends and holidays automatically
-    ## because we only have snapshots on days the pipeline ran (market days only)
+    ## Fetch yesterday's 4:00 PM snapshot price — the market's last settled price before today
+    ## Uses mid (bid/ask midpoint) when available; falls back to lastPrice for old rows without mid
+    ## "Yesterday" = most recent trading day before today — skips weekends automatically
+    ## because snapshots only exist on days the pipeline ran (market days only)
     df = query(
         """
-        SELECT lastPrice
+        SELECT mid, lastPrice
         FROM bronze_options_raw
         WHERE contractSymbol = ?
-          AND lastPrice > 0                        -- exclude zero prints
-          AND HOUR(snapshot_time) >= 17            -- PM snapshot only (4:15 PM EST = 21:15 UTC, hour >= 17 covers it)
-          AND DATE(snapshot_time) < CURRENT_DATE   -- strictly before today — excludes today's AM/PM snapshots
-        ORDER BY snapshot_time DESC                -- most recent first
-        LIMIT 1                                    -- only the single most recent prior PM snapshot
+          AND (mid > 0 OR lastPrice > 0)             -- Sep 2026: accept either price — old CSVs lack mid
+          AND HOUR(snapshot_time) >= 17              -- PM snapshot only (4:00 PM EDT = 20:00 UTC, hour >= 17 covers it)
+          AND DATE(snapshot_time) < CURRENT_DATE     -- strictly before today — excludes today's AM/PM snapshots
+        ORDER BY snapshot_time DESC                  -- most recent first
+        LIMIT 1                                      -- only the single most recent prior PM snapshot
         """, [symbol]
     )
-    if df.empty:                                   ## no prior PM snapshot — first day of data
+    if df.empty:                                     ## no prior PM snapshot — first day of data
         return None
-    return float(df.iloc[0]["lastPrice"])          ## return as plain float for arithmetic in metric cards
+    row = df.iloc[0]
+    ## Sep 2026: prefer mid over lastPrice — same logic as get_ohlc_data
+    ## mid is continuous; lastPrice can be stale if last trade was early afternoon
+    price = row["mid"] if (pandas.notna(row["mid"]) and row["mid"] > 0) else row["lastPrice"]
+    return float(price)                              ## return plain float for arithmetic in metric cards
 
 def get_today_ohlc(symbol: str) -> dict:
     ## reuse get_ohlc_data() which already builds open/high/low/close from AM+PM snapshots
@@ -347,28 +355,40 @@ def get_current_greeks(symbol):
 
 @st.cache_data(ttl=60)  ## cache 60s — OHLC built from bronze snapshots, only changes when pipeline runs
 def get_ohlc_data(symbol):
-    """Build synthetic OHLC from open(9:35)+close(16:15) snapshots."""
+    """Build synthetic OHLC from open(9:50 AM)+close(4:00 PM) snapshots."""
     df = query(
         """
-        SELECT snapshot_time::DATE AS trade_date, snapshot_time, lastPrice, openInterest
+        SELECT snapshot_time::DATE AS trade_date, snapshot_time,
+               mid, lastPrice, openInterest
         FROM bronze_options_raw
-        WHERE contractSymbol = ? AND lastPrice > 0 AND impliedVolatility > 0.01
+        WHERE contractSymbol = ?
+          AND (mid > 0 OR lastPrice > 0)          -- Sep 2026: accept rows with either price — old CSVs lack mid
+          AND impliedVolatility > 0.01
         ORDER BY snapshot_time
         """, [symbol]
     )
     if df.empty:
         return pandas.DataFrame(columns=["date","open","high","low","close","oi"])
 
+    ## Sep 2026: prefer bid/ask midpoint over lastPrice for open and close
+    ## mid updates continuously from market makers; lastPrice only updates on a trade
+    ## OTM options can go 30-60 min without a trade → lastPrice is stale at 9:50 AM open
+    ## COALESCE logic: use mid when it exists and is > 0; otherwise fall back to lastPrice
+    df["price"] = df["mid"].where(                              ## start with mid column
+        df["mid"].notna() & (df["mid"] > 0),                   ## valid mid: not null AND positive
+        other=df["lastPrice"]                                   ## fallback: lastPrice for old rows without mid
+    )
+
     df["hour"]  = pandas.to_datetime(df["snapshot_time"]).dt.hour
-    morning     = df[df["hour"] < 17].groupby("trade_date")["lastPrice"].first()   ## Aug 2026: split at 17 UTC — 9:35 AM EST = 13 UTC (morning), 4:15 PM EST = 21 UTC (afternoon)
-    afternoon   = df[df["hour"] >= 17].groupby("trade_date")["lastPrice"].last()  ## was < 12 / >= 12 which assumed EST timestamps; droplet runs UTC so both snapshots fell into afternoon
+    morning     = df[df["hour"] < 17].groupby("trade_date")["price"].first()   ## AM snapshot (9:50 AM EDT = ~13 UTC) → open
+    afternoon   = df[df["hour"] >= 17].groupby("trade_date")["price"].last()  ## PM snapshot (4:00 PM EDT = ~20 UTC) → close
     oi_daily    = df.groupby("trade_date")["openInterest"].last()
 
     ohlc = pandas.DataFrame({"open": morning, "close": afternoon}).reindex(sorted(set(morning.index) | set(afternoon.index)))
-    ohlc["open"]  = ohlc["open"].combine_first(ohlc["close"])
-    ohlc["close"] = ohlc["close"].combine_first(ohlc["open"])
-    ohlc["high"]  = ohlc[["open","close"]].max(axis=1)
-    ohlc["low"]   = ohlc[["open","close"]].min(axis=1)
+    ohlc["open"]  = ohlc["open"].combine_first(ohlc["close"])   ## if AM snapshot missing, use PM as open
+    ohlc["close"] = ohlc["close"].combine_first(ohlc["open"])   ## if PM snapshot missing, use AM as close
+    ohlc["high"]  = ohlc[["open","close"]].max(axis=1)          ## synthetic high — best of 2 snapshots
+    ohlc["low"]   = ohlc[["open","close"]].min(axis=1)          ## synthetic low — worst of 2 snapshots
     ohlc["oi"]    = oi_daily
     return ohlc.reset_index().rename(columns={"trade_date":"date"}).dropna(subset=["open","close"])
 
