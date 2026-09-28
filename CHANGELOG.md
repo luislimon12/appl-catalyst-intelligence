@@ -4,6 +4,18 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [1.0.1] — Session 10 continued · September 2026
+
+### Feature — IV smile curve on Options Chain
+
+* `2_Options_Chain.py` → `render_skew_chart()` — replaced bubble chart with clean IV smile curve. Calls rendered as blue `lines+markers`, puts as red `lines+markers`. Removed `volume` from SELECT, removed min-volume slider, removed bubble sizing math (`size_c`, `size_p`). Caption updated from "IV Skew · Bubble size = volume" to "IV Smile".
+
+### Bug fix — DTE zone filter conflicting with specific expiry selection
+
+* `2_Options_Chain.py` — DTE zone filter now skipped when a specific expiry is selected (`and selected_expiry == "ALL"` guard added). When a single expiry is chosen its DTE is already fixed — applying a zone filter on top always conflicts (e.g. Sep 28 '26 has DTE=1 but zone set to 30-60d returns zero rows). DTE zone only applies when expiry = ALL.
+
+---
+
 ## [1.0.0] — Session 10 · September 2026
 
 ### Bug fix — stale Open / Prev Close prices (bid/ask midpoint)

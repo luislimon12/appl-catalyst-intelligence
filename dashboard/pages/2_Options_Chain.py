@@ -40,7 +40,7 @@ def render_skew_chart(ticker, expiry, spot):
 
     ## Single query — iv and volume in same table, no merge needed
     df = query("""
-        SELECT strike, option_type, iv, volume
+        SELECT strike, option_type, iv
         FROM gold_latest_snapshot
         WHERE ticker = ? AND expiry = ? AND iv > 0
         ORDER BY strike
@@ -48,37 +48,28 @@ def render_skew_chart(ticker, expiry, spot):
     if df.empty:
         return
 
-    df["volume"] = df["volume"].fillna(0)  ## replace NA with 0 so size calc doesn't break
-
-    ## Min volume slider — raise to filter out strikes with unreliable IV (wide spread, no trades)
-    min_vol = st.slider("Min volume (skew)", 0, 500, 0, 10, key="skew_min_vol")
-
-    calls = df[(df["option_type"] == "call") & (df["volume"] >= min_vol)]
-    puts  = df[(df["option_type"] == "put")  & (df["volume"] >= min_vol)]
-
-    ## Scale volume to bubble size: 0 → 4px (minimum visible), max volume → 40px
-    max_vol = df["volume"].max() or 1          ## avoid div by zero if all volume is 0
-    size_c  = (calls["volume"] / max_vol * 36 + 4).clip(4, 40)  ## calls bubble sizes
-    size_p  = (puts["volume"]  / max_vol * 36 + 4).clip(4, 40)  ## puts bubble sizes
+    ## Sep 2026: removed volume filter and bubble sizing — smile curve shape is the signal
+    calls = df[df["option_type"] == "call"]  ## calls — rendered as blue line
+    puts  = df[df["option_type"] == "put"]   ## puts  — rendered as red line
 
     fig = go.Figure()
 
-    ## Call IV bubbles — blue, size = call volume at that strike
+    ## Sep 2026: IV smile curves — calls blue line, puts red line
+    ## lines+markers: continuous curve shows the smile shape; small markers at each strike for hover precision
     fig.add_trace(go.Scatter(
         x=calls["strike"], y=calls["iv"] * 100,
-        mode="markers", name="Calls",
-        marker=dict(color="#388bfd", size=size_c, opacity=0.8),
-        customdata=calls["volume"],
-        hovertemplate="Strike: $%{x}<br>Call IV: %{y:.1f}%<br>Vol: %{customdata:,.0f}<extra></extra>",
+        mode="lines+markers", name="Calls",
+        line=dict(color="#388bfd", width=2),    ## blue line for calls
+        marker=dict(size=5),                    ## small markers — shape is the signal, not individual points
+        hovertemplate="Strike: $%{x}<br>Call IV: %{y:.1f}%<extra></extra>",
     ))
 
-    ## Put IV bubbles — red, size = put volume at that strike
     fig.add_trace(go.Scatter(
         x=puts["strike"], y=puts["iv"] * 100,
-        mode="markers", name="Puts",
-        marker=dict(color="#f85149", size=size_p, opacity=0.8),
-        customdata=puts["volume"],
-        hovertemplate="Strike: $%{x}<br>Put IV: %{y:.1f}%<br>Vol: %{customdata:,.0f}<extra></extra>",
+        mode="lines+markers", name="Puts",
+        line=dict(color="#f85149", width=2),    ## red line for puts
+        marker=dict(size=5),
+        hovertemplate="Strike: $%{x}<br>Put IV: %{y:.1f}%<extra></extra>",
     ))
 
     ## Spot price vertical line — marks ATM on the skew
@@ -95,7 +86,7 @@ def render_skew_chart(ticker, expiry, spot):
         legend=dict(bgcolor="#161b22", bordercolor="#30363d", borderwidth=1),
     )
     st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"IV Skew · {format_expiry(expiry)} · Bubble size = volume · Blue = Calls · Red = Puts · Spot in yellow")
+    st.caption(f"IV Smile · {format_expiry(expiry)} · Blue = Calls · Red = Puts · Spot in yellow")
 
 def render_term_structure(ticker, spot):
     ## CHANGED Jul 2026: switched x-axis from calendar date → DTE (days to expiry)
@@ -348,7 +339,10 @@ if df.empty:
 ## Jun 25 2026: apply DTE bucket filter
 ## dte_bucket(row["dte"]) converts the integer DTE to a zone label like "⚡ <30d"
 ## We compare that label to what the user selected in the dropdown
-if dte_filter != "All":
+## Sep 2026: skip DTE zone filter when a specific expiry is selected —
+## expiry already pins the DTE, applying a zone filter on top always conflicts
+## DTE zone is only meaningful when expiry = ALL (showing multiple expiries at once)
+if dte_filter != "All" and selected_expiry == "ALL":
     df = df[df["dte"].apply(dte_bucket) == dte_filter]
 
 ## Jun 25 2026: apply activity/liquidity filter
