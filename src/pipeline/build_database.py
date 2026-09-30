@@ -147,12 +147,24 @@ class DatabaseBuilder:
 
             print(f"Loading options file: {file_path}")
 
+            ## Sep 2026: peek at CSV headers before building INSERT
+            ## Old CSVs (pre-Sep 2026) have no mid column — asking DuckDB to resolve mid by name
+            ## causes a positional fallback that shifts all subsequent columns left by one,
+            ## landing inTheMoney in the snapshot_time (TIMESTAMP) slot → ConversionException
+            ## Fix: inject NULL literal for old CSVs so DuckDB never looks up a missing column
+            csv_cols = self.con.execute(
+                f"SELECT * FROM read_csv_auto('{file_path}', header=True) LIMIT 0"
+            ).df().columns.tolist()                           ## read headers only — zero rows fetched
+            mid_expr = "TRY_CAST(mid AS FLOAT)" if "mid" in csv_cols else "NULL"
+            ## mid_expr = "TRY_CAST(mid AS FLOAT)" for new CSVs — casts midpoint to float
+            ## mid_expr = "NULL"                  for old CSVs — inserts NULL, no column lookup
+
             self.con.execute(f"""
                 INSERT INTO bronze_options_raw
                 SELECT
                     contractSymbol, expiry, option_type, strike,
                     bid, ask,
-                    TRY_CAST(mid AS FLOAT),   -- Sep 2026: NULL-safe cast — old CSVs without mid column return NULL instead of crashing
+                    {mid_expr},   -- Sep 2026: NULL for old CSVs (no mid column), TRY_CAST(mid AS FLOAT) for new
                     lastPrice, volume, openInterest,
                     impliedVolatility, delta, gamma, theta, vega,
                     -- inTheMoney arrives as 'True'/'False' OR '1.0'/'0.0' depending on pandas version
