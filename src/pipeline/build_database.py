@@ -171,8 +171,13 @@ class DatabaseBuilder:
                     -- types={{'inTheMoney':'VARCHAR'}} forces DuckDB to read it as a string first
                     -- CASE then normalises both formats into a proper BOOLEAN
                     CASE
-                        WHEN LOWER(inTheMoney) IN ('true',  '1', '1.0') THEN TRUE
-                        WHEN LOWER(inTheMoney) IN ('false', '0', '0.0') THEN FALSE
+                        -- Sep 2026: CAST(inTheMoney AS VARCHAR) before LOWER —
+                        -- read_csv_auto ignores types={{'inTheMoney':'VARCHAR'}} on this DuckDB version
+                        -- and auto-detects the True/False column as BOOLEAN
+                        -- LOWER(BOOLEAN) is unimplemented → throws BOOLEAN→TIMESTAMP cast error
+                        -- explicit CAST to VARCHAR first works whether column is BOOLEAN or string
+                        WHEN LOWER(CAST(inTheMoney AS VARCHAR)) IN ('true',  '1', '1.0') THEN TRUE
+                        WHEN LOWER(CAST(inTheMoney AS VARCHAR)) IN ('false', '0', '0.0') THEN FALSE
                         ELSE NULL
                     END AS inTheMoney,
                     snapshot_time, snapshot_str, ticker,
