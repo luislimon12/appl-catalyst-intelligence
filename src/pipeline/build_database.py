@@ -47,7 +47,6 @@ class DatabaseBuilder:
             strike FLOAT,
             bid FLOAT,
             ask FLOAT,
-            mid FLOAT,         -- Sep 2026: bid/ask midpoint — reliable price when no trade has occurred
             lastPrice FLOAT,
             volume INTEGER,
             openInterest INTEGER,
@@ -147,37 +146,18 @@ class DatabaseBuilder:
 
             print(f"Loading options file: {file_path}")
 
-            ## Sep 2026: peek at CSV headers before building INSERT
-            ## Old CSVs (pre-Sep 2026) have no mid column — asking DuckDB to resolve mid by name
-            ## causes a positional fallback that shifts all subsequent columns left by one,
-            ## landing inTheMoney in the snapshot_time (TIMESTAMP) slot → ConversionException
-            ## Fix: inject NULL literal for old CSVs so DuckDB never looks up a missing column
-            csv_cols = self.con.execute(
-                f"SELECT * FROM read_csv_auto('{file_path}', header=True) LIMIT 0"
-            ).df().columns.tolist()                           ## read headers only — zero rows fetched
-            mid_expr = "TRY_CAST(mid AS FLOAT)" if "mid" in csv_cols else "NULL"
-            ## mid_expr = "TRY_CAST(mid AS FLOAT)" for new CSVs — casts midpoint to float
-            ## mid_expr = "NULL"                  for old CSVs — inserts NULL, no column lookup
-
             self.con.execute(f"""
                 INSERT INTO bronze_options_raw
                 SELECT
                     contractSymbol, expiry, option_type, strike,
-                    bid, ask,
-                    {mid_expr},   -- Sep 2026: NULL for old CSVs (no mid column), TRY_CAST(mid AS FLOAT) for new
-                    lastPrice, volume, openInterest,
+                    bid, ask, lastPrice, volume, openInterest,
                     impliedVolatility, delta, gamma, theta, vega,
                     -- inTheMoney arrives as 'True'/'False' OR '1.0'/'0.0' depending on pandas version
                     -- types={{'inTheMoney':'VARCHAR'}} forces DuckDB to read it as a string first
                     -- CASE then normalises both formats into a proper BOOLEAN
                     CASE
-                        -- Sep 2026: CAST(inTheMoney AS VARCHAR) before LOWER —
-                        -- read_csv_auto ignores types={{'inTheMoney':'VARCHAR'}} on this DuckDB version
-                        -- and auto-detects the True/False column as BOOLEAN
-                        -- LOWER(BOOLEAN) is unimplemented → throws BOOLEAN→TIMESTAMP cast error
-                        -- explicit CAST to VARCHAR first works whether column is BOOLEAN or string
-                        WHEN LOWER(CAST(inTheMoney AS VARCHAR)) IN ('true',  '1', '1.0') THEN TRUE
-                        WHEN LOWER(CAST(inTheMoney AS VARCHAR)) IN ('false', '0', '0.0') THEN FALSE
+                        WHEN LOWER(inTheMoney) IN ('true',  '1', '1.0') THEN TRUE
+                        WHEN LOWER(inTheMoney) IN ('false', '0', '0.0') THEN FALSE
                         ELSE NULL
                     END AS inTheMoney,
                     snapshot_time, snapshot_str, ticker,
