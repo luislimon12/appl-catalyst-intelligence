@@ -4,6 +4,18 @@ All significant changes documented in reverse chronological order.
 
 ---
 
+## [1.0.2] — Session 11 · October 2026
+
+### Data — 10-year AAPL historical price ingested
+
+* `notebooks/ingest_historical_price.ipynb` — one-off migration notebook. Loaded `notebooks/archive-5/AAPL.csv` (2,706 daily rows, Jan 2016 → Oct 2026) into `bronze_price_raw`. Steps: rename columns to match schema, drop `adjclose` and `ingested_at_utc`, compute `HV_20` and `HV_252` via rolling log-return std annualized by `sqrt(252)`, add synthetic `snapshot_time = Date 16:00:00` metadata, deduplicate against existing DB dates (610 already loaded, 2,096 new rows inserted), rebuild Silver and Gold. `silver_price_daily` now has 3,294 rows covering a full decade — `gold_iv_rank` IV percentile and IV rank are now meaningful with a 10-year baseline instead of 6 months.
+
+### Bug fix — reverted `mid` column (pipeline stability)
+
+* Rolled back `mid FLOAT` column from `bronze_options_raw` schema and all associated `mid_expr` logic in `build_database.py`. Root cause post-mortem: adding `mid` to the table schema (20 columns) while old CSVs had 18 data columns caused a positional column shift in the Bronze INSERT — `inTheMoney` landed in the `snapshot_time` (TIMESTAMP) slot → `BOOLEAN → TIMESTAMP` ConversionException. Additionally, a DuckDB version update on the droplet caused `read_csv_auto` to ignore `types={{'inTheMoney': 'VARCHAR'}}` override, auto-detecting True/False as BOOLEAN which made `LOWER(BOOLEAN)` fail. Fix: restored `build_database.py` and `3_Contract_Tracker.py` to pre-mid state via `git checkout fdbf5df`, dropped `mid` column from DB via `ALTER TABLE bronze_options_raw DROP COLUMN mid`. `mid` is still computed in `collect_market_snapshots.py` and saved to CSVs but not ingested — `build_database.py` ignores it by explicit column name listing.
+
+---
+
 ## [1.0.1] — Session 10 continued · September 2026
 
 ### Feature — IV smile curve on Options Chain
